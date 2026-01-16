@@ -9,7 +9,7 @@ import torchaudio.transforms as T
 from hifigan.models import Generator as HiFiGAN
 from hifigan.utils import AttrDict
 from torch import Tensor
-from torchaudio.sox_effects import apply_effects_tensor
+#from torchaudio.sox_effects import apply_effects_tensor
 from wavlm.WavLM import WavLM
 from knnvc_utils import generate_matrix_from_index
 
