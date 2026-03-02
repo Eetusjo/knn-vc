@@ -21,13 +21,21 @@ from hubconf import knn_vc as load_knn_vc
 
 # Step 1: Load the kNN-VC model from LOCAL implementation
 print("Loading kNN-VC model from local code...")
-knn_vc = load_knn_vc(prematched=True, pretrained=True, device='cuda')
+knn_vc = load_knn_vc(prematched=True, pretrained=True, device='cpu')
 
 # Step 2: Specify your audio files
 # Replace these with your actual file paths
-src_wav_path = 'path/to/source.wav'  # The speech content to morph
-ref_A_paths = ['path/to/speaker_A_ref1.wav', 'path/to/speaker_A_ref2.wav']  # Start speaker
-ref_B_paths = ['path/to/speaker_B_ref1.wav', 'path/to/speaker_B_ref2.wav']  # End speaker
+test_id = 0
+ref_minutes = 10
+
+source = "nainen"
+target = "mies"
+longsrc = True
+
+src_wav_path = f'sample_data/{source}/test/{source}_test{"_20s" if longsrc else ""}_{test_id}.wav'
+#src_wav_path = f'sample_data/{source}/test/{source}_test_{test_id}.wav'
+ref_A_paths = [f'sample_data/{source}/ref/{source}_ref_{i}.wav' for i in range(ref_minutes)]
+ref_B_paths = [f'sample_data/{target}/ref/{target}_ref_{i}.wav' for i in range(ref_minutes)]
 
 # Step 3: Extract features
 print("Extracting features...")
@@ -41,7 +49,7 @@ out_wav = knn_vc.match_morph(
     query_seq,
     matching_set_A,
     matching_set_B,
-    topk=4,
+    topk=12,
     morph_profile='linear'  # Try: 'linear', 'sigmoid', 'step'
 )
 
