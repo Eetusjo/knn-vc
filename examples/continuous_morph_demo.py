@@ -16,12 +16,20 @@ Usage:
 Requirements:
     - torch, torchaudio, numpy (see README.md)
     - Input audio files should be 16kHz, single-channel WAV files
+
+NOTE: This uses the LOCAL implementation. To use torch.hub (remote repo),
+you'll need to wait for the morphing feature to be merged upstream.
 """
 
 import argparse
+import sys
 import torch
 import torchaudio
 from pathlib import Path
+
+# Add parent directory to path to import local knn-vc modules
+repo_root = Path(__file__).parent.parent
+sys.path.insert(0, str(repo_root))
 
 
 def main():
@@ -103,16 +111,16 @@ def main():
     print("kNN-VC Continuous Morphing Demo")
     print("=" * 60)
 
-    # Load kNN-VC model
+    # Load kNN-VC model from local implementation
     print("\n[1/5] Loading kNN-VC model...")
     print(f"      Device: {args.device}")
     print(f"      Prematched vocoder: {args.prematched}")
+    print(f"      Using LOCAL implementation")
 
-    knn_vc = torch.hub.load(
-        'bshall/knn-vc',
-        'knn_vc',
+    from hubconf import knn_vc as load_knn_vc
+
+    knn_vc = load_knn_vc(
         prematched=args.prematched,
-        trust_repo=True,
         pretrained=True,
         device=args.device
     )
