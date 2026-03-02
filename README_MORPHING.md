@@ -63,6 +63,9 @@ match_morph(
     topk: int = 4,
     morph_profile: str = 'linear',
     morph_params: dict = None,
+    silence_aware: bool = False,
+    vad_threshold_db: float = -40,
+    vad_min_silence_ms: int = 50,
     tgt_loudness_db: float | None = -16,
     target_duration: float | None = None,
     device: str | None = None
@@ -78,6 +81,15 @@ match_morph(
 - **`topk`**: Number of nearest neighbors to average (default: 4)
   - Lower values (2-3): More source characteristics preserved
   - Higher values (6-8): Smoother output, less distinct
+- **`silence_aware`**: Enable silence-aware morphing (default: False)
+  - When True, alpha only advances during speech, frozen during silence
+  - See [Silence-Aware Morphing](#silence-aware-morphing) section below
+- **`vad_threshold_db`**: Energy threshold in dB for voice activity detection (default: -40)
+  - Lower values (e.g., -50): More sensitive, treat quieter regions as speech
+  - Higher values (e.g., -30): Less sensitive, treat more regions as silence
+- **`vad_min_silence_ms`**: Minimum silence duration in milliseconds (default: 50)
+  - Silence spans shorter than this are treated as speech
+  - Helps filter out brief dips in energy within continuous speech
 - **`morph_profile`**: Type of interpolation curve
   - `'linear'`: Constant rate of change (default)
   - `'sigmoid'`: Smooth S-curve transition
@@ -252,6 +264,136 @@ Continuous morphing requires:
 
 **Total: ~2× the time of standard conversion**, which is still very fast since kNN is efficient.
 
+## Silence-Aware Morphing
+
+By default, the morphing profile advances uniformly over time, **including during silence periods**. This can cause perceptual discontinuities when speech resumes after a pause.
+
+**Silence-aware morphing** addresses this by advancing the alpha coefficient only during active speech, freezing it during silence.
+
+### The Problem
+
+With standard time-based morphing:
+```
+[Speech A] [Pause] [Speech B] [Pause] [Speech C]
+  α=0.0    α=0.33   α=0.67    α=0.84   α=1.0
+           ↑ morphing continues during silence
+```
+
+During the pause at t=0.33, alpha has advanced to 33% even though no speech occurred. When Speech B starts, it's immediately at 67% morphing, creating an abrupt transition.
+
+### The Solution
+
+With silence-aware morphing:
+```
+[Speech A] [Pause] [Speech B] [Pause] [Speech C]
+  α=0.0    α=0.0    α=0.5     α=0.5    α=1.0
+           ↑ frozen           ↑ frozen
+```
+
+Alpha only advances during voiced segments, creating smoother, more natural transitions.
+
+### Usage
+
+```python
+out_wav = knn_vc.match_morph(
+    query_seq,
+    matching_set_A,
+    matching_set_B,
+    topk=8,
+    silence_aware=True,          # Enable silence-aware morphing
+    vad_threshold_db=-40,        # Energy threshold for VAD
+    vad_min_silence_ms=50        # Ignore silence shorter than 50ms
+)
+```
+
+### Parameters
+
+- **`silence_aware`** (bool): Enable silence-aware morphing
+  - `False` (default): Alpha advances uniformly over time
+  - `True`: Alpha frozen during silence, advances only during speech
+
+- **`vad_threshold_db`** (float): Energy threshold in dB relative to maximum (default: -40)
+  - Lower values (e.g., -50): More sensitive, treat quieter regions as speech
+  - Higher values (e.g., -30): Less sensitive, treat more regions as silence
+  - Typical range: -50 to -30 dB
+
+- **`vad_min_silence_ms`** (int): Minimum silence duration in milliseconds (default: 50)
+  - Silence spans shorter than this are treated as speech
+  - Helps filter out brief pauses between syllables
+  - Typical range: 30 to 100 ms
+
+### When to Use
+
+**Use silence-aware morphing when:**
+- Your utterance has significant pauses (>100ms)
+- You want morphing to happen only during voiced segments
+- Testing perceptual effects of morphing timing
+
+**Use standard morphing when:**
+- Continuous speech with no pauses
+- You want morphing to complete by a specific time point
+- Simpler, more predictable behavior desired
+
+### Visualization
+
+To visualize the difference between standard and silence-aware morphing:
+
+```bash
+python examples/visualize_silence_aware.py \
+    --source sample_data/mies/test/mies_test_0.wav \
+    --output silence_aware_comparison.png
+```
+
+This generates a plot showing:
+1. Voice activity detection (speech vs. silence)
+2. Standard alpha profile (advances uniformly)
+3. Silence-aware alpha profile (frozen during silence)
+
+### How It Works
+
+Silence-aware morphing uses energy-based voice activity detection (VAD):
+
+1. **Compute energy** per frame (L2 norm of WavLM features)
+2. **Threshold** energy to classify frames as speech or silence
+3. **Filter** short silence spans (< `vad_min_silence_ms`)
+4. **Generate alpha** that advances only during speech frames
+5. **Ensure** alpha reaches 1.0 at the final speech frame
+
+The VAD operates directly on WavLM features, ensuring perfect frame alignment with the morphing process.
+
+### Example Comparison
+
+```python
+# Standard morphing
+out_standard = knn_vc.match_morph(
+    query_seq, match_A, match_B,
+    silence_aware=False
+)
+
+# Silence-aware morphing
+out_silence_aware = knn_vc.match_morph(
+    query_seq, match_A, match_B,
+    silence_aware=True,
+    vad_threshold_db=-40
+)
+```
+
+Listen to both outputs to compare the perceptual difference. Silence-aware morphing typically sounds more natural for utterances with pauses.
+
+### Tuning the VAD Threshold
+
+If the VAD is too sensitive or not sensitive enough, adjust `vad_threshold_db`:
+
+```python
+# More sensitive (detect more as speech)
+out = knn_vc.match_morph(..., vad_threshold_db=-50)
+
+# Less sensitive (detect more as silence)
+out = knn_vc.match_morph(..., vad_threshold_db=-30)
+```
+
+Use the visualization script to inspect VAD decisions before generating the full morphed output.
+
 ## Troubleshooting
 
 **Problem**: Output doesn't sound like either speaker
@@ -261,10 +403,21 @@ Continuous morphing requires:
 **Problem**: Transition is too abrupt
 - **Solution**: Use sigmoid profile instead of linear
 - **Solution**: Decrease sigmoid steepness: `morph_params={'steepness': 5}`
+- **Solution**: Try silence-aware morphing to avoid discontinuities at pauses
 
 **Problem**: Not enough morphing (sounds mostly like one speaker)
 - **Solution**: Verify both matching sets are different speakers
 - **Solution**: Check that source audio duration is sufficient for smooth transition
+
+**Problem**: Silence-aware morphing sounds choppy
+- **Solution**: VAD may be too sensitive, increase threshold: `vad_threshold_db=-30`
+- **Solution**: Increase minimum silence duration: `vad_min_silence_ms=100`
+- **Solution**: Use visualization script to inspect VAD decisions
+
+**Problem**: Silence-aware morphing behaves like standard
+- **Solution**: VAD may not be detecting silence, lower threshold: `vad_threshold_db=-50`
+- **Solution**: Check if your audio actually has pauses (use visualization script)
+- **Solution**: Verify audio is clean (background noise can be detected as speech)
 
 **Problem**: Audio quality degradation
 - **Solution**: This is expected behavior - morphing creates ambiguous speaker identity

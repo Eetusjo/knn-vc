@@ -4,7 +4,12 @@ Unit tests for continuous morphing functionality.
 
 import torch
 import pytest
-from matcher import generate_morph_profile
+from matcher import (
+    generate_morph_profile,
+    generate_morph_profile_silence_aware,
+    detect_voice_activity_energy,
+    _filter_short_silences
+)
 
 
 class TestMorphProfiles:
@@ -121,6 +126,243 @@ class TestMorphProfiles:
         for profile in ['linear', 'sigmoid', 'step']:
             alpha = generate_morph_profile(n_frames, profile=profile)
             assert alpha.shape == (n_frames,)
+
+
+class TestVoiceActivityDetection:
+    """Test suite for energy-based VAD."""
+
+    def test_vad_all_speech(self):
+        """VAD should mark all frames as speech if energy is uniformly high."""
+        # Create high-energy features (simulating speech)
+        features = torch.randn(100, 1024) * 5.0  # High amplitude
+        is_speech = detect_voice_activity_energy(features, threshold_db=-40)
+
+        # All frames should be detected as speech
+        assert is_speech.sum() >= 95, f"Expected mostly speech, got {is_speech.sum()}/100"
+
+    def test_vad_all_silence(self):
+        """VAD should mark all frames as silence if energy is very low."""
+        # Create very low-energy features (simulating silence)
+        features = torch.randn(100, 1024) * 1e-6
+        is_speech = detect_voice_activity_energy(features, threshold_db=-40)
+
+        # All frames should be detected as silence
+        assert is_speech.sum() == 0, f"Expected all silence, got {is_speech.sum()} speech frames"
+
+    def test_vad_mixed_content(self):
+        """VAD should distinguish speech from silence in mixed audio."""
+        features = torch.zeros(100, 1024)
+
+        # First 30 frames: high energy (speech)
+        features[0:30] = torch.randn(30, 1024) * 5.0
+
+        # Middle 40 frames: very low energy (silence)
+        features[30:70] = torch.randn(40, 1024) * 1e-6
+
+        # Last 30 frames: high energy (speech)
+        features[70:100] = torch.randn(30, 1024) * 5.0
+
+        is_speech = detect_voice_activity_energy(features, threshold_db=-40)
+
+        # Check that speech regions are detected
+        assert is_speech[0:30].sum() >= 25, "First speech region not detected"
+        assert is_speech[70:100].sum() >= 25, "Second speech region not detected"
+
+        # Check that silence region is detected (may have some false positives at boundaries)
+        assert is_speech[35:65].sum() <= 10, "Silence region incorrectly marked as speech"
+
+    def test_vad_threshold_sensitivity(self):
+        """Lower threshold should detect more frames as speech."""
+        features = torch.randn(100, 1024) * 0.5  # Medium energy
+
+        # Stricter threshold (higher value, less sensitive)
+        is_speech_strict = detect_voice_activity_energy(features, threshold_db=-20)
+
+        # Looser threshold (lower value, more sensitive)
+        is_speech_loose = detect_voice_activity_energy(features, threshold_db=-50)
+
+        # Loose threshold should detect more speech
+        assert is_speech_loose.sum() >= is_speech_strict.sum()
+
+    def test_vad_output_shape(self):
+        """VAD should return boolean tensor with correct shape."""
+        features = torch.randn(100, 1024)
+        is_speech = detect_voice_activity_energy(features)
+
+        assert is_speech.shape == (100,), f"Expected shape (100,), got {is_speech.shape}"
+        assert is_speech.dtype == torch.bool, f"Expected bool dtype, got {is_speech.dtype}"
+
+    def test_filter_short_silences(self):
+        """Short silence spans should be filtered out."""
+        # Create pattern: speech (10) → silence (3) → speech (10)
+        is_speech = torch.tensor([True]*10 + [False]*3 + [True]*10)
+
+        # Filter silences shorter than 5 frames
+        filtered = _filter_short_silences(is_speech, min_frames=5)
+
+        # The 3-frame silence should now be marked as speech
+        assert filtered[10:13].all(), "Short silence not filtered"
+
+    def test_filter_preserves_long_silences(self):
+        """Long silence spans should be preserved."""
+        # Create pattern: speech (10) → silence (10) → speech (10)
+        is_speech = torch.tensor([True]*10 + [False]*10 + [True]*10)
+
+        # Filter silences shorter than 5 frames
+        filtered = _filter_short_silences(is_speech, min_frames=5)
+
+        # The 10-frame silence should remain
+        assert not filtered[10:20].any(), "Long silence incorrectly filtered"
+
+
+class TestSilenceAwareMorphing:
+    """Test suite for silence-aware morph profile generation."""
+
+    def test_silence_aware_alpha_frozen_during_silence(self):
+        """Alpha should freeze during silence spans."""
+        # Pattern: speech (20) → silence (10) → speech (20)
+        is_speech = torch.tensor([True]*20 + [False]*10 + [True]*20)
+
+        alpha = generate_morph_profile_silence_aware(50, is_speech, 'linear')
+
+        # During silence (frames 20-29), alpha should be constant
+        silence_alpha = alpha[20:30]
+        assert torch.all(silence_alpha == silence_alpha[0]), \
+            "Alpha should be constant during silence"
+
+        # Alpha at frame 20 (last speech before silence) should equal alpha during silence
+        assert torch.isclose(alpha[19], alpha[25]), \
+            "Silence alpha should equal last speech value"
+
+    def test_silence_aware_alpha_advances_during_speech(self):
+        """Alpha should advance during speech frames."""
+        # Pattern: speech (20) → silence (10) → speech (20)
+        is_speech = torch.tensor([True]*20 + [False]*10 + [True]*20)
+
+        alpha = generate_morph_profile_silence_aware(50, is_speech, 'linear')
+
+        # Alpha should increase during first speech segment
+        assert alpha[19] > alpha[0], "Alpha should increase during speech"
+
+        # Alpha should increase during second speech segment
+        assert alpha[49] > alpha[30], "Alpha should increase during speech"
+
+    def test_silence_aware_reaches_one(self):
+        """Alpha should reach 1.0 at the final speech frame."""
+        # Pattern: speech (30) → silence (20)
+        is_speech = torch.tensor([True]*30 + [False]*20)
+
+        alpha = generate_morph_profile_silence_aware(50, is_speech, 'linear')
+
+        # Alpha should be 1.0 at last speech frame (index 29) and all subsequent frames
+        assert torch.isclose(alpha[29], torch.tensor(1.0), atol=1e-6), \
+            f"Alpha should be 1.0 at last speech frame, got {alpha[29]}"
+        assert torch.all(alpha[29:] == 1.0), \
+            "Alpha should remain 1.0 after last speech frame"
+
+    def test_silence_aware_no_speech(self):
+        """All silence should result in alpha=0 everywhere."""
+        is_speech = torch.zeros(100, dtype=torch.bool)
+
+        alpha = generate_morph_profile_silence_aware(100, is_speech, 'linear')
+
+        assert torch.all(alpha == 0.0), \
+            "All-silence input should produce alpha=0 everywhere"
+
+    def test_silence_aware_no_silence(self):
+        """No silence should behave like standard morphing."""
+        is_speech = torch.ones(100, dtype=torch.bool)
+
+        alpha_silence_aware = generate_morph_profile_silence_aware(100, is_speech, 'linear')
+        alpha_standard = generate_morph_profile(100, 'linear')
+
+        # Both should be very similar (minor differences due to implementation)
+        assert torch.allclose(alpha_silence_aware, alpha_standard, atol=0.02), \
+            "No-silence should behave like standard morphing"
+
+    def test_silence_aware_starts_with_silence(self):
+        """Silence at start should keep alpha at 0."""
+        # Pattern: silence (20) → speech (30)
+        is_speech = torch.tensor([False]*20 + [True]*30)
+
+        alpha = generate_morph_profile_silence_aware(50, is_speech, 'linear')
+
+        # Alpha should be 0 during initial silence
+        assert torch.all(alpha[0:20] == 0.0), \
+            "Alpha should be 0 during initial silence"
+
+        # Alpha should advance during speech
+        assert alpha[49] > alpha[20], \
+            "Alpha should advance after silence ends"
+
+    def test_silence_aware_ends_with_silence(self):
+        """Silence at end should freeze alpha at last speech value."""
+        # Pattern: speech (30) → silence (20)
+        is_speech = torch.tensor([True]*30 + [False]*20)
+
+        alpha = generate_morph_profile_silence_aware(50, is_speech, 'linear')
+
+        # Alpha during final silence should equal 1.0 (last speech value)
+        assert torch.all(alpha[30:] == 1.0), \
+            "Alpha should be frozen at 1.0 during final silence"
+
+    def test_silence_aware_sigmoid_profile(self):
+        """Silence-aware should work with sigmoid profile."""
+        # Pattern: speech (20) → silence (10) → speech (20)
+        is_speech = torch.tensor([True]*20 + [False]*10 + [True]*20)
+
+        alpha = generate_morph_profile_silence_aware(
+            50, is_speech, 'sigmoid', {'steepness': 10}
+        )
+
+        # Check basic properties
+        assert alpha[0] < alpha[49], "Alpha should increase overall"
+        assert torch.all(alpha[20:30] == alpha[20]), "Alpha frozen during silence"
+        assert torch.isclose(alpha[49], torch.tensor(1.0), atol=0.05), \
+            "Alpha should reach ~1.0 at end"
+
+    def test_silence_aware_step_profile(self):
+        """Silence-aware should work with step profile."""
+        # Pattern: speech (25) → silence (10) → speech (25)
+        is_speech = torch.tensor([True]*25 + [False]*10 + [True]*25)
+
+        alpha = generate_morph_profile_silence_aware(
+            60, is_speech, 'step', {'threshold': 0.5}
+        )
+
+        # Step should transition at 50% of speech content (25 speech frames)
+        # First 25 speech frames: α≈0
+        # Next 25 speech frames: α≈1
+        assert alpha[24] < 0.5, "First half of speech should have α<0.5"
+        assert alpha[59] > 0.5, "Second half of speech should have α>0.5"
+
+    def test_silence_aware_alternating_pattern(self):
+        """Complex speech/silence pattern should be handled correctly."""
+        # Pattern: S(10) Si(5) S(10) Si(5) S(10) Si(5) S(10) Si(5)
+        is_speech = torch.cat([
+            torch.tensor([True]*10 + [False]*5) for _ in range(4)
+        ])
+
+        alpha = generate_morph_profile_silence_aware(60, is_speech, 'linear')
+
+        # Alpha should be frozen during each silence segment
+        for i in range(4):
+            silence_start = 10 + i * 15
+            silence_end = silence_start + 5
+            silence_alpha = alpha[silence_start:silence_end]
+
+            assert torch.all(silence_alpha == silence_alpha[0]), \
+                f"Alpha not frozen during silence segment {i}"
+
+    def test_silence_aware_output_range(self):
+        """Alpha should always be in [0, 1] range."""
+        is_speech = torch.tensor([True]*30 + [False]*20 + [True]*30)
+
+        for profile in ['linear', 'sigmoid', 'step']:
+            alpha = generate_morph_profile_silence_aware(80, is_speech, profile)
+
+            assert torch.all(alpha >= 0.0), f"{profile}: Alpha contains values < 0"
+            assert torch.all(alpha <= 1.0), f"{profile}: Alpha contains values > 1"
 
 
 if __name__ == '__main__':
