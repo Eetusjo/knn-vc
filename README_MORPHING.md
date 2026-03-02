@@ -302,7 +302,8 @@ out_wav = knn_vc.match_morph(
     topk=8,
     silence_aware=True,          # Enable silence-aware morphing
     vad_threshold_db=-40,        # Energy threshold for VAD
-    vad_min_silence_ms=50        # Ignore silence shorter than 50ms
+    vad_min_silence_ms=50,       # Ignore silence shorter than 50ms
+    query_wav_path='source.wav'  # For accurate waveform-based VAD
 )
 ```
 
@@ -351,15 +352,28 @@ This generates a plot showing:
 
 ### How It Works
 
-Silence-aware morphing uses energy-based voice activity detection (VAD):
+Silence-aware morphing uses energy-based voice activity detection (VAD) with two modes:
 
-1. **Compute energy** per frame (L2 norm of WavLM features)
+**Waveform-based VAD (Recommended):**
+1. **Compute RMS energy** per frame from raw audio waveform
 2. **Threshold** energy to classify frames as speech or silence
 3. **Filter** short silence spans (< `vad_min_silence_ms`)
 4. **Generate alpha** that advances only during speech frames
 5. **Ensure** alpha reaches 1.0 at the final speech frame
 
-The VAD operates directly on WavLM features, ensuring perfect frame alignment with the morphing process.
+**Feature-based VAD (Fallback):**
+- Uses variance of WavLM features instead of waveform energy
+- Automatic if source audio path not provided
+- Less accurate but still effective for many use cases
+
+To use waveform-based VAD (recommended), provide the source audio path:
+```python
+out = knn_vc.match_morph(
+    query_seq, match_a, match_b,
+    silence_aware=True,
+    query_wav_path='source.wav'  # ← Enables waveform-based VAD
+)
+```
 
 ### Example Comparison
 

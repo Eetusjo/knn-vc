@@ -86,9 +86,10 @@ def main():
         matching_set_B,
         topk=8,
         morph_profile='linear',
-        silence_aware=True,        # Enable silence-aware morphing
+        silence_aware=True,         # Enable silence-aware morphing
         vad_threshold_db=-40,       # Energy threshold for VAD
-        vad_min_silence_ms=50       # Minimum silence duration
+        vad_min_silence_ms=50,      # Minimum silence duration
+        query_wav_path=src_wav_path  # Provide waveform for accurate VAD
     )
     print(f"      Generated {len(out_silence_aware) / 16000:.2f}s of audio")
 
@@ -143,7 +144,8 @@ def main():
         morph_profile='sigmoid',
         morph_params={'steepness': 10},
         silence_aware=True,
-        vad_threshold_db=-40
+        vad_threshold_db=-40,
+        query_wav_path=src_wav_path
     )
 
     std_sig_path = output_dir / f'morph_standard_sigmoid_{source}_to_{target}_test{test_id}.wav'

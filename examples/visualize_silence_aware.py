@@ -88,10 +88,19 @@ def main():
 
     # Detect voice activity
     print(f"\n[3/4] Detecting voice activity (threshold: {args.vad_threshold} dB)")
+
+    # Load waveform for accurate VAD
+    waveform, sr = torchaudio.load(args.source)
+    if sr != 16000:
+        waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=16000)
+    waveform = waveform.squeeze()
+
     is_speech = detect_voice_activity_energy(
         query_seq,
         threshold_db=args.vad_threshold,
-        min_duration_ms=50
+        min_duration_ms=50,
+        waveform=waveform,  # Use waveform for accurate VAD
+        hop_length=320
     )
     n_speech = is_speech.sum().item()
     n_silence = n_frames - n_speech
@@ -115,12 +124,11 @@ def main():
     # Time axis in seconds
     time_sec = np.arange(n_frames) * 0.02
 
-    # Plot 1: Waveform (load and plot original audio)
-    waveform, sr = torchaudio.load(args.source)
-    waveform = waveform.squeeze().numpy()
-    time_wav = np.arange(len(waveform)) / sr
+    # Plot 1: Waveform (already loaded above for VAD)
+    waveform_np = waveform.numpy()
+    time_wav = np.arange(len(waveform_np)) / 16000
 
-    axes[0].plot(time_wav, waveform, linewidth=0.5, color='steelblue')
+    axes[0].plot(time_wav, waveform_np, linewidth=0.5, color='steelblue')
     axes[0].set_ylabel('Amplitude')
     axes[0].set_title(f'Source Audio: {Path(args.source).name}')
     axes[0].set_xlim(0, duration_sec)
