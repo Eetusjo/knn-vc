@@ -32,32 +32,36 @@ source = "nainen"
 target = "mies"
 longsrc = True
 
-src_wav_path = f'sample_data/{source}/test/{source}_test{"_20s" if longsrc else ""}_{test_id}.wav'
+#src_wav_path = f'sample_data/{source}/test/{source}_test{"_20s" if longsrc else ""}_{test_id}.wav'
 #src_wav_path = f'sample_data/{source}/test/{source}_test_{test_id}.wav'
+src_wav_paths = [f"sample_data/japping/japping_ref_{i}.wav" for i in range(8)]
 ref_A_paths = [f'sample_data/{source}/ref/{source}_ref_{i}.wav' for i in range(ref_minutes)]
 ref_B_paths = [f'sample_data/{target}/ref/{target}_ref_{i}.wav' for i in range(ref_minutes)]
 
 # Step 3: Extract features
 print("Extracting features...")
-query_seq = knn_vc.get_features(src_wav_path)
 matching_set_A = knn_vc.get_matching_set(ref_A_paths)
 matching_set_B = knn_vc.get_matching_set(ref_B_paths)
 
 # Step 4: Perform continuous morphing
 print("Performing morphing...")
-out_wav = knn_vc.match_morph(
-    query_seq,
-    matching_set_A,
-    matching_set_B,
-    topk=12,
-    morph_profile='linear'  # Try: 'linear', 'sigmoid', 'step'
-)
-
-# Step 5: Save the result
-print("Saving output...")
-torchaudio.save('morphed_output.wav', out_wav[None], 16000)
-
-print("Done! Output saved to: morphed_output.wav")
+for i, src_wav_path in enumerate(src_wav_paths):
+    query_seq = knn_vc.get_features(src_wav_path)
+    #out_wav = knn_vc.match_morph(
+    #    query_seq,
+    #    matching_set_A,
+    #    matching_set_B,
+    #    silence_aware=True,
+    #    vad_threshold_db=-30,
+    #    topk=10,
+    #    query_wav_path=src_wav_path,
+    #    morph_profile='linear'
+    #)
+    out_wav = knn_vc.match(query_seq, matching_set_A, topk=4)
+    # Step 5: Save the result
+    morph_fname = f'morphed_{i}.wav'
+    torchaudio.save(morph_fname, out_wav[None], 16000)
+    print(f"Done! Output saved to: {morph_fname}")
 
 # ============================================================================
 # Tips:
