@@ -34,9 +34,13 @@ longsrc = True
 
 #src_wav_path = f'sample_data/{source}/test/{source}_test{"_20s" if longsrc else ""}_{test_id}.wav'
 #src_wav_path = f'sample_data/{source}/test/{source}_test_{test_id}.wav'
-src_wav_paths = [f"sample_data/japping/japping_ref_{i}.wav" for i in range(8)]
-ref_A_paths = [f'sample_data/{source}/ref/{source}_ref_{i}.wav' for i in range(ref_minutes)]
-ref_B_paths = [f'sample_data/{target}/ref/{target}_ref_{i}.wav' for i in range(ref_minutes)]
+#src_wav_paths = [f"sample_data/japping2/japping_ref_{i}.wav" for i in range(5)]
+src_wav_paths = ["sample_data/Recording.wav"]
+#ref_A_paths = [f'sample_data/{source}/ref/{source}_ref_{i}.wav' for i in range(ref_minutes)]
+#ref_B_paths = [f'sample_data/{target}/ref/{target}_ref_{i}.wav' for i in range(ref_minutes)]
+ref_A_paths = [f"sample_data/japping2/japping_ref_{i}.wav" for i in range(5)]
+ref_B_paths = ["sample_data/sv-speech.wav", "sample_data/sv-nonsense.wav"]
+
 
 # Step 3: Extract features
 print("Extracting features...")
@@ -57,7 +61,7 @@ for i, src_wav_path in enumerate(src_wav_paths):
     #    query_wav_path=src_wav_path,
     #    morph_profile='linear'
     #)
-    out_wav = knn_vc.match(query_seq, matching_set_A, topk=4)
+    out_wav = knn_vc.match(query_seq, matching_set_B, topk=8)
     # Step 5: Save the result
     morph_fname = f'morphed_{i}.wav'
     torchaudio.save(morph_fname, out_wav[None], 16000)

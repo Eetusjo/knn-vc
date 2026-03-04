@@ -13,6 +13,9 @@ from torch import Tensor
 from wavlm.WavLM import WavLM
 from knnvc_utils import generate_matrix_from_index
 
+# Union type for vocoder — HiFiGAN or BigVGANVocoder (or any nn.Module with same interface)
+Vocoder = nn.Module
+
 
 SPEAKER_INFORMATION_LAYER = 6
 SPEAKER_INFORMATION_WEIGHTS = generate_matrix_from_index(SPEAKER_INFORMATION_LAYER)
@@ -328,20 +331,20 @@ class KNeighborsVC(nn.Module):
 
     def __init__(self,
         wavlm: WavLM,
-        hifigan: HiFiGAN,
+        hifigan: Vocoder,
         hifigan_cfg: AttrDict,
         device='cuda'
     ) -> None:
-        """ kNN-VC matcher. 
+        """ kNN-VC matcher.
         Arguments:
             - `wavlm` : trained WavLM model
-            - `hifigan`: trained hifigan model
-            - `hifigan_cfg`: hifigan config to use for vocoding.
+            - `hifigan`: trained vocoder model (HiFiGAN or BigVGANVocoder)
+            - `hifigan_cfg`: vocoder config with at least sampling_rate field.
         """
         super().__init__()
         # set which features to extract from wavlm
         self.weighting = torch.tensor(SPEAKER_INFORMATION_WEIGHTS, device=device)[:, None]
-        # load hifigan
+        # load hifigan (or bigvgan wrapper)
         self.hifigan = hifigan.eval()
         self.h = hifigan_cfg
         # store wavlm
