@@ -505,7 +505,7 @@ class KNeighborsVC(nn.Module):
         device = torch.device(device) if device is not None else self.device
 
         # If synth sets not provided, use matching sets
-        if synth_set_A is None: synth_set_A = matching_set_A.to(device
+        if synth_set_A is None: synth_set_A = matching_set_A.to(device)
         else: synth_set_A = synth_set_A.to(device)
         if synth_set_B is None: synth_set_B = matching_set_B.to(device)
         else: synth_set_B = synth_set_B.to(device)
