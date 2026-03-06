@@ -177,7 +177,7 @@ class KNeighborsVC(nn.Module):
 
 
     @torch.inference_mode()
-    def match(self, query_seq: Tensor, matching_set: Tensor, synth_set: Tensor = None, 
+    def match(self, query_seq: Tensor, matching_set: Tensor, synth_set: Tensor = None,
               topk: int = 4, tgt_loudness_db: float | None = -16,
               target_duration: float | None = None, device: str | None = None) -> Tensor:
         """ Given `query_seq`, `matching_set`, and `synth_set` tensors of shape (N, dim), perform kNN regression matching
@@ -186,9 +186,9 @@ class KNeighborsVC(nn.Module):
             - `matching_set`: Tensor (N2, dim) of the matching set used as the 'training set' for the kNN algorithm.
             - `synth_set`: optional Tensor (N2, dim) corresponding to the matching set. We use the matching set to assign each query
                 vector to a vector in the matching set, and then use the corresponding vector from the synth set during HiFiGAN synthesis.
-                By default, and for best performance, this should be identical to the matching set. 
+                By default, and for best performance, this should be identical to the matching set.
             - `topk`: k in the kNN -- the number of nearest neighbors to average over.
-            - `tgt_loudness_db`: float db used to normalize the output volume. Set to None to disable. 
+            - `tgt_loudness_db`: float db used to normalize the output volume. Set to None to disable.
             - `target_duration`: if set to a float, interpolate resulting waveform duration to be equal to this value in seconds.
             - `device`: if None, uses default device at initialization. Otherwise uses specified device
         Returns:
@@ -208,15 +208,101 @@ class KNeighborsVC(nn.Module):
         dists = fast_cosine_dist(query_seq, matching_set, device=device)
         best = dists.topk(k=topk, largest=False, dim=-1)
         out_feats = synth_set[best.indices].mean(dim=1)
-        
+
         prediction = self.vocode(out_feats[None].to(device)).cpu().squeeze()
-        
+
         # normalization
         if tgt_loudness_db is not None:
             src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
             tgt_loudness = tgt_loudness_db
             pred_wav = torchaudio.functional.gain(prediction, tgt_loudness - src_loudness)
         else: pred_wav = prediction
+        return pred_wav
+
+    @torch.inference_mode()
+    def match_morph(self, query_seq: Tensor,
+                    matching_set_A: Tensor,
+                    matching_set_B: Tensor,
+                    synth_set_A: Tensor = None,
+                    synth_set_B: Tensor = None,
+                    topk: int = 4,
+                    morph_profile: str = 'linear',
+                    morph_params: dict = None,
+                    tgt_loudness_db: float | None = -16,
+                    target_duration: float | None = None,
+                    device: str | None = None) -> Tensor:
+        """
+        Perform continuous morphing from Speaker A to Speaker B over the duration of the utterance.
+
+        Arguments:
+            - query_seq: Tensor (N, dim) - source utterance features from get_features()
+            - matching_set_A: Tensor (N_A, dim) - reference features for speaker A
+            - matching_set_B: Tensor (N_B, dim) - reference features for speaker B
+            - synth_set_A: optional Tensor (N_A, dim) - synthesis features for Speaker A
+            - synth_set_B: optional Tensor (N_B, dim) - synthesis features for Speaker B
+            - topk: int - k for knn matching
+            - morph_profile: str - type of interpolation curve ('linear', 'sigmoid', 'step', 'custom')
+            - morph_params: dict - profile-specific parameters
+            - tgt_loudness_db: float - target loudness in dB for normalization (None to disable)
+            - target_duration: float - target duration in seconds (None to use source duration)
+            - device: str - compute device ('cuda', 'cpu', etc.)
+
+        Returns:
+            - converted waveform of shape (T,) with continuous morphing from A to B
+
+        Example:
+            >>> query_seq = knn_vc.get_features('source.wav')
+            >>> matching_A = knn_vc.get_matching_set(['speaker_A_ref.wav'])
+            >>> matching_B = knn_vc.get_matching_set(['speaker_B_ref.wav'])
+            >>> morphed = knn_vc.match_morph(query_seq, matching_A, matching_B, topk=4)
+        """
+        device = torch.device(device) if device is not None else self.device
+
+        # If synth sets not provided, use matching sets
+        if synth_set_A is None: synth_set_A = matching_set_A.to(device
+        else: synth_set_A = synth_set_A.to(device)
+        if synth_set_B is None: synth_set_B = matching_set_B.to(device)
+        else: synth_set_B = synth_set_B.to(device)
+
+        matching_set_A = matching_set_A.to(device)
+        matching_set_B = matching_set_B.to(device)
+        query_seq = query_seq.to(device)
+
+        # Handle target duration by interpolating query sequence
+        if target_duration is not None:
+            target_samples = int(target_duration * self.sr)
+            scale_factor = (target_samples / self.hop_length) / query_seq.shape[0]
+            query_seq = F.interpolate(query_seq.T[None], scale_factor=scale_factor, mode='linear')[0].T
+
+        # Generate morphing profile alpha(t) in [0, 1] over the utterance
+        n_frames = query_seq.shape[0]
+        alpha = generate_morph_profile(n_frames, morph_profile, morph_params).to(device)  # (n_frames,)
+
+        # In this continuous setup perform knn matching against both speakers independently.
+        # this allows using a source utterance form a third speaker
+        # TODO(eetu): maybe just use the source feats when the source is from ref speaker A?
+        dists_A = fast_cosine_dist(query_seq, matching_set_A, device=device)  # (n_frames, N_A)
+        dists_B = fast_cosine_dist(query_seq, matching_set_B, device=device)  # (n_frames, N_B)
+
+        # Get top-k nearest for each speaker
+        best_A = dists_A.topk(k=topk, largest=False, dim=-1)  # indices: (n_frames, k)
+        best_B = dists_B.topk(k=topk, largest=False, dim=-1)  # indices: (n_frames, k)
+
+        # Compute mean of k nearest neighbors for each frame, for each speaker
+        out_feats_A = synth_set_A[best_A.indices].mean(dim=1)  # (n_frames, dim)
+        out_feats_B = synth_set_B[best_B.indices].mean(dim=1)  # (n_frames, dim)
+
+        # linear combination according to morphing profile
+        out_feats = (1 - alpha[:, None]) * out_feats_A + alpha[:, None] * out_feats_B
+
+        prediction = self.vocode(out_feats[None].to(device)).cpu().squeeze()
+
+        if tgt_loudness_db is not None:
+            src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
+            pred_wav = torchaudio.functional.gain(prediction, tgt_loudness_db - src_loudness)
+        else:
+            pred_wav = prediction
+
         return pred_wav
 
 
