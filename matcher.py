@@ -29,6 +29,56 @@ def fast_cosine_dist(source_feats: Tensor, matching_pool: Tensor, device: str = 
     return dists
 
 
+def generate_morph_profile(n_frames: int, profile: str = 'linear', params: dict = None) -> Tensor:
+    """
+    Generate time-varying interpolation coefficients alpha(t) for continuous morphing.
+
+    Arguments:
+        - n_frames: Number of frames in the query sequence
+        - profile: Type of interpolation curve
+            * 'linear'
+            * 'sigmoid'
+            * 'step': (aburupt change from 0 to 1 at t)
+            * 'custom': custom array
+        - params: Profile-specific ps
+            * For 'sigmoid': {'steepness': float} (default 10, higher = steeper)
+            * For 'step': {'threshold': float} (default 0.5, when to transition)
+            * For 'custom': {'alpha_values': Tensor or list} (must have n_frames elements)
+
+    Returns:
+        - Tensor of shape (n_frames,) with values in [0, 1]
+          where 0 = 100% Speaker A, 1 = 100% Speaker B
+    """
+    if params is None:
+        params = {}
+
+    # Create normalized time vector [0, 1]
+    t = torch.linspace(0, 1, n_frames)
+
+    if profile == 'linear':
+        alpha = t
+    elif profile == 'sigmoid':
+        # Smooth S-curve transition, centered at t=0.5
+        k = params.get('steepness', 10)
+        alpha = torch.sigmoid(k * (t - 0.5))
+        # Normalize to ensure alpha[0] ≈ 0 and alpha[-1] ≈ 1
+        alpha = (alpha - alpha[0]) / (alpha[-1] - alpha[0])
+    elif profile == 'step':
+        threshold = params.get('threshold', 0.5)
+        alpha = (t >= threshold).float()
+    elif profile == 'custom':
+        alpha_values = params.get('alpha_values')
+        if alpha_values is None:
+            raise ValueError("Custom profile requires 'alpha_values' in params")
+        alpha = torch.tensor(alpha_values, dtype=torch.float32) if not isinstance(alpha_values, Tensor) else alpha_values
+        if alpha.shape[0] != n_frames:
+            raise ValueError(f"Custom alpha must have {n_frames} values, got {alpha.shape[0]}")
+    else:
+        raise ValueError(f"Unknown morph profile: {profile}. Choose from ['linear', 'sigmoid', 'step', 'custom']")
+
+    return alpha
+
+
 class KNeighborsVC(nn.Module):
 
     def __init__(self,
