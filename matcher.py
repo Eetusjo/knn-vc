@@ -83,14 +83,19 @@ def detect_voice_activity_energy(
     features: Tensor,
     threshold_db: float = -40,
     min_duration_ms: int = 50,
-    frame_rate_hz: int = 50
+    frame_rate_hz: int = 50,
+    waveform: Tensor = None,
+    hop_length: int = 320
 ) -> Tensor:
     """
-    Detect voice activity using energy-based thresholding on WavLM features.
+    Detect voice activity using energy-based thresholding.
 
-    This is a simple but effective VAD that operates directly on feature vectors,
-    ensuring perfect frame alignment. It computes the L2 norm of each feature vector
-    as a proxy for energy, then applies a dB threshold.
+    This VAD can operate in two modes:
+    1. Feature-based (default): Uses variance of WavLM features as energy proxy
+    2. Waveform-based (if waveform provided): Uses RMS energy from raw audio
+
+    The feature-based mode ensures perfect frame alignment but may be less accurate.
+    The waveform-based mode is more accurate but requires the original audio.
 
     Arguments:
         - features: Tensor (n_frames, feat_dim) - WavLM features from get_features()
@@ -101,6 +106,8 @@ def detect_voice_activity_energy(
             * Silence spans shorter than this are treated as speech
             * Helps filter out brief dips in energy within continuous speech
         - frame_rate_hz: int - Feature frame rate in Hz (default: 50, i.e., 20ms frames)
+        - waveform: optional Tensor (n_samples,) - Raw audio waveform for more accurate VAD
+        - hop_length: int - Hop length in samples for waveform framing (default: 320)
 
     Returns:
         - Boolean tensor of shape (n_frames,) where True = speech, False = silence
@@ -110,12 +117,28 @@ def detect_voice_activity_energy(
         >>> is_speech = detect_voice_activity_energy(query_seq, threshold_db=-40)
         >>> print(f"Speech frames: {is_speech.sum()} / {len(is_speech)}")
     """
-    # Compute energy per frame (L2 norm of feature vector)
-    # Higher norm = more energy = likely speech
-    energy = features.norm(dim=1)  # (n_frames,)
+    if waveform is not None:
+        # Waveform-based VAD: More accurate, uses RMS energy
+        n_frames = features.shape[0]
+        frame_energy = torch.zeros(n_frames)
 
-    # Convert to dB scale for more intuitive thresholding
-    energy_db = 20 * torch.log10(energy + 1e-8)
+        for i in range(n_frames):
+            start_sample = i * hop_length
+            end_sample = min(start_sample + hop_length, waveform.shape[-1])
+            frame_wav = waveform[..., start_sample:end_sample]
+            # RMS energy (mean squared)
+            frame_energy[i] = (frame_wav ** 2).mean()
+
+        # Convert to dB
+        energy_db = 10 * torch.log10(frame_energy + 1e-10)
+    else:
+        # Feature-based VAD: Use variance across feature dimensions
+        # Variance is a better proxy for energy than L2 norm for normalized features
+        # Speech has high variance (dynamic content), silence has low variance
+        energy = features.var(dim=1)  # (n_frames,)
+
+        # Convert to dB scale (using 10 * log10 for variance/power)
+        energy_db = 10 * torch.log10(energy + 1e-10)
 
     # Normalize so that maximum energy = 0 dB
     # All other frames are negative dB relative to max
@@ -446,6 +469,7 @@ class KNeighborsVC(nn.Module):
                     silence_aware: bool = False,
                     vad_threshold_db: float = -40,
                     vad_min_silence_ms: int = 50,
+                    query_wav_path: str = None,
                     tgt_loudness_db: float | None = -16,
                     target_duration: float | None = None,
                     device: str | None = None) -> Tensor:
@@ -464,6 +488,7 @@ class KNeighborsVC(nn.Module):
             - silence_aware: bool - if True, alpha only advances during speech, frozen during silence
             - vad_threshold_db: float - energy threshold in dB for VAD (default: -40)
             - vad_min_silence_ms: int - minimum silence duration in ms (default: 50)
+            - query_wav_path: str - optional path to source audio for waveform-based VAD (more accurate)
             - tgt_loudness_db: float - target loudness in dB for normalization (None to disable)
             - target_duration: float - target duration in seconds (None to use source duration)
             - device: str - compute device ('cuda', 'cpu', etc.)
@@ -500,11 +525,21 @@ class KNeighborsVC(nn.Module):
 
         if silence_aware:
             # Detect voice activity to identify speech vs. silence frames
+            waveform = None
+            if query_wav_path is not None:
+                # Load waveform for more accurate VAD
+                wav, sr = torchaudio.load(query_wav_path, normalize=True)
+                if sr != self.sr:
+                    wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.sr)
+                waveform = wav.squeeze()  # (n_samples,)
+
             is_speech = detect_voice_activity_energy(
                 query_seq.cpu(),  # VAD operates on CPU
                 threshold_db=vad_threshold_db,
                 min_duration_ms=vad_min_silence_ms,
-                frame_rate_hz=50  # WavLM features at 20ms = 50Hz
+                frame_rate_hz=50,  # WavLM features at 20ms = 50Hz
+                waveform=waveform,
+                hop_length=self.hop_length
             )
 
             # Generate silence-aware profile: alpha only advances during speech
