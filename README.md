@@ -55,6 +55,17 @@ out_wav = knn_vc.match(query_seq, matching_set, topk=4)
 That's it! These default settings provide pretty good results, but feel free to modify the kNN `topk` or use the non-prematched vocoder.
 Note: the target speaker from `ref_wav_paths` _can be anything_, but should be clean speech from the desired speaker. The longer the cumulative duration of all reference waveforms, the better the quality will be (but the slower it will take to run). The improvement in quality diminishes beyond 5 minutes of reference speech.
 
+## Continuous Morphing
+
+```python
+# Get features for two target speakers
+matching_set_A = knn_vc.get_matching_set(['speaker_A_ref.wav'])
+matching_set_B = knn_vc.get_matching_set(['speaker_B_ref.wav'])
+
+# Morph from A to B over the utterance
+out_wav = knn_vc.match_morph(query_seq, matching_set_A, matching_set_B, topk=4)
+```
+
 ## Checkpoints
 
 Under the releases tab of this repo we provide three checkpoints:
