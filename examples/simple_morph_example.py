@@ -1,10 +1,17 @@
+import sys
+from pathlib import Path
+
+# Add parent directory to path to import local knn-vc modules
+repo_root = Path(__file__).parent.parent
+sys.path.insert(0, str(repo_root))
+
 import torch
 import torchaudio
+from hubconf import knn_vc as load_knn_vc
 
 # Step 1: Load the kNN-VC model
-print("Loading kNN-VC model")
-knn_vc = torch.hub.load('bshall/knn-vc', 'knn_vc', prematched=True,
-                        trust_repo=True, pretrained=True, device='cuda')
+print("Loading kNN-VC model from local code...")
+knn_vc = load_knn_vc(prematched=True, pretrained=True, device='cuda')
 
 # Step 2: Specify your audio files
 # Replace these with your actual file paths
