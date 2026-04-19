@@ -9,11 +9,13 @@ Training Phases:
   Phase A (~50k steps): Train projection layer only, BigVGAN backbone frozen.
   Phase B (~100k-300k steps): Unfreeze BigVGAN, train end-to-end at lower LR.
 
+Supports single-GPU and multi-GPU (single-node) training via torchrun.
+
 Usage:
   # Extract WavLM features first:
   python scripts/extract_wavlm_features.py --audio_dir /path/to/audio --out_dir /path/to/feats
 
-  # Phase A: Train projection only
+  # Phase A: Train projection only (single GPU)
   python train_bigvgan.py \\
       --audio_dir /path/to/audio \\
       --feat_dir /path/to/feats \\
@@ -21,8 +23,16 @@ Usage:
       --phase A \\
       --steps 50000
 
+  # Phase A: Train projection only (multi-GPU via torchrun)
+  torchrun --nproc_per_node=4 train_bigvgan.py \\
+      --audio_dir /path/to/audio \\
+      --feat_dir /path/to/feats \\
+      --checkpoint_dir ./checkpoints/bigvgan \\
+      --phase A \\
+      --steps 50000
+
   # Phase B: Fine-tune end-to-end (start from Phase A checkpoint)
-  python train_bigvgan.py \\
+  torchrun --nproc_per_node=4 train_bigvgan.py \\
       --audio_dir /path/to/audio \\
       --feat_dir /path/to/feats \\
       --checkpoint_dir ./checkpoints/bigvgan \\
@@ -47,8 +57,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 import torchaudio
-from torch.utils.data import DataLoader, Dataset
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, Dataset, DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 
 import bigvgan as bigvgan_module
@@ -65,6 +77,32 @@ from bigvgan.loss import (
     generator_loss,
 )
 from bigvgan_vocoder import BigVGANVocoder
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Distributed helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def setup_distributed():
+    """Initialize distributed training if launched via torchrun. Returns (rank, local_rank, world_size)."""
+    if 'RANK' in os.environ:
+        dist.init_process_group(backend='nccl')
+        rank = dist.get_rank()
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = dist.get_world_size()
+        torch.cuda.set_device(local_rank)
+        return rank, local_rank, world_size
+    else:
+        return 0, 0, 1
+
+
+def cleanup_distributed():
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def is_main_process(rank):
+    return rank == 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -163,11 +201,15 @@ class WavLMVocoderDataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch):
+    # Unwrap DDP modules to save the underlying state_dict
+    def unwrap(m):
+        return m.module if isinstance(m, DDP) else m
+
     torch.save({
-        'projection': vocoder.projection.state_dict(),
-        'bigvgan': vocoder.bigvgan.state_dict(),
-        'mpd': mpd.state_dict(),
-        'mrd': mrd.state_dict(),
+        'projection': unwrap(vocoder).projection.state_dict(),
+        'bigvgan': unwrap(vocoder).bigvgan.state_dict(),
+        'mpd': unwrap(mpd).state_dict(),
+        'mrd': unwrap(mrd).state_dict(),
         'optim_g': optim_g.state_dict(),
         'optim_d': optim_d.state_dict(),
         'steps': steps,
@@ -184,11 +226,13 @@ def load_checkpoint(path, device):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def train(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"[Train] Using device: {device}")
+    rank, local_rank, world_size = setup_distributed()
+    device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
+
+    if is_main_process(rank):
+        print(f"[Train] world_size={world_size}, device={device}")
 
     # ── Load pretrained BigVGAN ──────────────────────────────────────────────
-    # Note: huggingface_hub>=1.0 removed proxies/resume_download from call chain
     bigvgan_model = bigvgan_module.BigVGAN._from_pretrained(
         model_id='nvidia/bigvgan_v2_24khz_100band_256x',
         revision=None,
@@ -226,21 +270,30 @@ def train(args):
         mrd.load_state_dict(ckpt['mrd'])
         steps = ckpt.get('steps', 0)
         start_epoch = ckpt.get('epoch', 0)
-        print(f"[Train] Resumed from {args.resume} at step {steps}")
+        if is_main_process(rank):
+            print(f"[Train] Resumed from {args.resume} at step {steps}")
 
     # ── Freeze/unfreeze based on phase ───────────────────────────────────────
     if args.phase == 'A':
-        print("[Train] Phase A: training projection layer only, BigVGAN frozen.")
+        if is_main_process(rank):
+            print("[Train] Phase A: training projection layer only, BigVGAN frozen.")
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = False
         g_params = list(vocoder.projection.parameters())
         lr_g = 2e-4
     else:
-        print("[Train] Phase B: end-to-end fine-tuning.")
+        if is_main_process(rank):
+            print("[Train] Phase B: end-to-end fine-tuning.")
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = True
         g_params = list(vocoder.parameters())
         lr_g = 1e-4  # Lower LR for end-to-end fine-tuning
+
+    # ── Wrap models with DDP ─────────────────────────────────────────────────
+    if world_size > 1:
+        vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=True)
+        mpd = DDP(mpd, device_ids=[local_rank])
+        mrd = DDP(mrd, device_ids=[local_rank])
 
     # ── Optimizers ───────────────────────────────────────────────────────────
     optim_g = torch.optim.AdamW(g_params, lr=lr_g, betas=(0.8, 0.99))
@@ -267,26 +320,33 @@ def train(args):
         segment_size=segment_size,
         target_sr=h.sampling_rate,
     )
+
+    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=(sampler is None),
+        sampler=sampler,
         num_workers=args.num_workers,
         drop_last=True,
         pin_memory=(device.type == 'cuda'),
     )
 
-    # ── Tensorboard ───────────────────────────────────────────────────────────
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    sw = SummaryWriter(os.path.join(args.checkpoint_dir, 'logs'))
+    # ── Tensorboard (main process only) ───────────────────────────────────────
+    sw = None
+    if is_main_process(rank):
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        sw = SummaryWriter(os.path.join(args.checkpoint_dir, 'logs'))
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    vocoder.bigvgan.train()
-    vocoder.projection.train()
+    vocoder.train()
     mpd.train()
     mrd.train()
 
     for epoch in range(start_epoch, 10000):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
         for feats, wav_real in loader:
             feats = feats.to(device)       # (B, frames, 1024)
             wav_real = wav_real.to(device).unsqueeze(1)  # (B, 1, T)
@@ -316,7 +376,6 @@ def train(args):
             optim_g.zero_grad()
 
             # Mel-spectrogram loss (multi-scale)
-            # MultiScaleMelSpectrogramLoss expects (B, C, T) — keep the channel dim
             loss_mel = mel_loss_fn(wav_gen, wav_real)
 
             # Adversarial + feature matching losses
@@ -332,8 +391,8 @@ def train(args):
             loss_g.backward()
             optim_g.step()
 
-            # ── Logging ─────────────────────────────────────────────────────
-            if steps % args.log_interval == 0:
+            # ── Logging (main process only) ─────────────────────────────────
+            if is_main_process(rank) and steps % args.log_interval == 0:
                 print(
                     f"Step {steps:,d} | "
                     f"G={loss_g.item():.3f} mel={loss_mel.item():.3f} "
@@ -344,21 +403,25 @@ def train(args):
                 sw.add_scalar('train/loss_mel', loss_mel.item(), steps)
                 sw.add_scalar('train/loss_d', loss_d.item(), steps)
 
-            # ── Checkpoint ──────────────────────────────────────────────────
-            if steps % args.save_interval == 0 and steps > 0:
+            # ── Checkpoint (main process only) ──────────────────────────────
+            if is_main_process(rank) and steps % args.save_interval == 0 and steps > 0:
                 ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}.pt'
                 save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch)
                 print(f"[Train] Saved checkpoint: {ckpt_path}")
 
             steps += 1
             if steps >= args.steps:
-                print(f"[Train] Reached {args.steps:,d} steps. Done.")
-                ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}_final.pt'
-                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch)
+                if is_main_process(rank):
+                    print(f"[Train] Reached {args.steps:,d} steps. Done.")
+                    ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}_final.pt'
+                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch)
+                cleanup_distributed()
                 return
 
         scheduler_g.step()
         scheduler_d.step()
+
+    cleanup_distributed()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
