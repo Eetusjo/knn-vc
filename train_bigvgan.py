@@ -170,8 +170,14 @@ class WavLMVocoderDataset(Dataset):
         feats = torch.load(feat_path, map_location='cpu').float()  # (seq_len, 1024)
 
         if self.split:
+            # Pad short utterances so every sample is exactly (frames_per_seg, 1024) / (segment_size,)
+            if feats.shape[0] < self.frames_per_seg:
+                feats = F.pad(feats, (0, 0, 0, self.frames_per_seg - feats.shape[0]))
+            if wav.shape[0] < self.segment_size:
+                wav = F.pad(wav, (0, self.segment_size - wav.shape[0]))
+
             # Random crop aligned between features and audio
-            max_feat_start = max(0, feats.shape[0] - self.frames_per_seg - 1)
+            max_feat_start = max(0, feats.shape[0] - self.frames_per_seg)
             feat_start = random.randint(0, max_feat_start)
             feat_end = feat_start + self.frames_per_seg
 
