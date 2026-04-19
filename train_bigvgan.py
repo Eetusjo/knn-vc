@@ -105,6 +105,10 @@ def is_main_process(rank):
     return rank == 0
 
 
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
@@ -119,6 +123,8 @@ class WavLMVocoderDataset(Dataset):
 
     Segment size is in samples at target_sr. Features are trimmed/padded to match.
     """
+
+    AUDIO_EXTS = ('.wav', '.flac', '.mp3', '.ogg', '.opus')
 
     def __init__(
         self,
@@ -137,13 +143,21 @@ class WavLMVocoderDataset(Dataset):
         self.split = split
         self.frames_per_seg = math.ceil(segment_size / target_sr * wavlm_frame_rate)
 
-        # Find all paired files
+        # Find all paired files (audio extension is discovered, not assumed)
         self.pairs = []
+        missing_audio = 0
         for feat_path in sorted(self.feat_dir.rglob('*.pt')):
-            rel = feat_path.relative_to(self.feat_dir).with_suffix('.wav')
-            audio_path = self.audio_dir / rel
-            if audio_path.exists():
+            rel_no_ext = feat_path.relative_to(self.feat_dir).with_suffix('')
+            audio_path = None
+            for ext in self.AUDIO_EXTS:
+                candidate = self.audio_dir / rel_no_ext.with_suffix(ext)
+                if candidate.exists():
+                    audio_path = candidate
+                    break
+            if audio_path is not None:
                 self.pairs.append((audio_path, feat_path))
+            else:
+                missing_audio += 1
 
         if len(self.pairs) == 0:
             raise ValueError(
@@ -152,7 +166,9 @@ class WavLMVocoderDataset(Dataset):
                 f"  feat_dir: {feat_dir}\n"
                 "Run scripts/extract_wavlm_features.py first."
             )
-        print(f"[Dataset] Found {len(self.pairs):,d} paired files.")
+        if missing_audio:
+            log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio file.")
+        log(f"[Dataset] Found {len(self.pairs):,d} paired files.")
 
     def __len__(self):
         return len(self.pairs)
@@ -206,11 +222,14 @@ class WavLMVocoderDataset(Dataset):
 # Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch):
+def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, phase):
     # Unwrap DDP modules to save the underlying state_dict
     def unwrap(m):
         return m.module if isinstance(m, DDP) else m
 
+    # Atomic write: save to .tmp then rename, so an interrupted save doesn't leave
+    # a half-written checkpoint on disk.
+    tmp_path = str(path) + '.tmp'
     torch.save({
         'projection': unwrap(vocoder).projection.state_dict(),
         'bigvgan': unwrap(vocoder).bigvgan.state_dict(),
@@ -220,11 +239,31 @@ def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch):
         'optim_d': optim_d.state_dict(),
         'steps': steps,
         'epoch': epoch,
-    }, path)
+        'phase': phase,
+    }, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path, device):
     return torch.load(path, map_location=device)
+
+
+def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
+    """Keep only the `keep_last` most-recent periodic checkpoints (ckpt_NNNNNN.pt).
+    Never touches *_final.pt or files with other naming."""
+    if keep_last <= 0:
+        return
+    ckpts = sorted(
+        checkpoint_dir.glob('ckpt_[0-9]*.pt'),
+        key=lambda p: p.stat().st_mtime,
+    )
+    # Keep only periodic (not final) checkpoints for pruning purposes
+    periodic = [p for p in ckpts if not p.name.endswith('_final.pt')]
+    for old in periodic[:-keep_last]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -236,7 +275,7 @@ def train(args):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
     if is_main_process(rank):
-        print(f"[Train] world_size={world_size}, device={device}")
+        log(f"[Train] world_size={world_size}, device={device}")
 
     # ── Load pretrained BigVGAN ──────────────────────────────────────────────
     bigvgan_model = bigvgan_module.BigVGAN._from_pretrained(
@@ -268,6 +307,8 @@ def train(args):
     # ── Resume from checkpoint ───────────────────────────────────────────────
     steps = 0
     start_epoch = 0
+    ckpt = None
+    resumed_phase = None
     if args.resume:
         ckpt = load_checkpoint(args.resume, device)
         vocoder.projection.load_state_dict(ckpt['projection'])
@@ -276,20 +317,21 @@ def train(args):
         mrd.load_state_dict(ckpt['mrd'])
         steps = ckpt.get('steps', 0)
         start_epoch = ckpt.get('epoch', 0)
+        resumed_phase = ckpt.get('phase', None)
         if is_main_process(rank):
-            print(f"[Train] Resumed from {args.resume} at step {steps}")
+            log(f"[Train] Resumed from {args.resume} at step {steps} (phase={resumed_phase})")
 
     # ── Freeze/unfreeze based on phase ───────────────────────────────────────
     if args.phase == 'A':
         if is_main_process(rank):
-            print("[Train] Phase A: training projection layer only, BigVGAN frozen.")
+            log("[Train] Phase A: training projection layer only, BigVGAN frozen.")
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = False
         g_params = list(vocoder.projection.parameters())
         lr_g = 2e-4
     else:
         if is_main_process(rank):
-            print("[Train] Phase B: end-to-end fine-tuning.")
+            log("[Train] Phase B: end-to-end fine-tuning.")
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = True
         g_params = list(vocoder.parameters())
@@ -309,11 +351,20 @@ def train(args):
     )
 
     if args.resume:
-        optim_g.load_state_dict(ckpt['optim_g'])
-        optim_d.load_state_dict(ckpt['optim_d'])
+        # Only restore optimizer state when continuing the SAME phase. A Phase A→B
+        # transition changes the generator's parameter set, so the saved optim_g
+        # state is incompatible.
+        same_phase = (resumed_phase == args.phase)
+        if same_phase:
+            optim_g.load_state_dict(ckpt['optim_g'])
+            optim_d.load_state_dict(ckpt['optim_d'])
+        else:
+            if is_main_process(rank):
+                log(f"[Train] Phase change (ckpt={resumed_phase} → run={args.phase}): "
+                    f"re-initializing optimizer states with fresh LR={lr_g:.1e}.")
 
-    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=0.999, last_epoch=start_epoch - 1)
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=0.999, last_epoch=start_epoch - 1)
+    scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
+    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
 
     # ── Loss functions ────────────────────────────────────────────────────────
     mel_loss_fn = MultiScaleMelSpectrogramLoss(sampling_rate=h.sampling_rate).to(device)
@@ -376,6 +427,11 @@ def train(args):
 
             loss_d = loss_d_mpd + loss_d_mrd
             loss_d.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    itertools.chain(mpd.parameters(), mrd.parameters()),
+                    args.grad_clip,
+                )
             optim_d.step()
 
             # ── Generator update ────────────────────────────────────────────
@@ -395,11 +451,22 @@ def train(args):
 
             loss_g = loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd
             loss_g.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
             optim_g.step()
+
+            # Stop training immediately if we hit a non-finite loss — for long
+            # runs this saves hours of wasted compute chasing NaNs.
+            if not (torch.isfinite(loss_g) and torch.isfinite(loss_d)):
+                if is_main_process(rank):
+                    log(f"[Train] ABORT: non-finite loss at step {steps} "
+                        f"(G={loss_g.item()}, D={loss_d.item()})")
+                cleanup_distributed()
+                return
 
             # ── Logging (main process only) ─────────────────────────────────
             if is_main_process(rank) and steps % args.log_interval == 0:
-                print(
+                log(
                     f"Step {steps:,d} | "
                     f"G={loss_g.item():.3f} mel={loss_mel.item():.3f} "
                     f"fm={loss_fm_mpd.item()+loss_fm_mrd.item():.3f} "
@@ -412,15 +479,16 @@ def train(args):
             # ── Checkpoint (main process only) ──────────────────────────────
             if is_main_process(rank) and steps % args.save_interval == 0 and steps > 0:
                 ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}.pt'
-                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch)
-                print(f"[Train] Saved checkpoint: {ckpt_path}")
+                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase)
+                log(f"[Train] Saved checkpoint: {ckpt_path}")
+                prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
             steps += 1
             if steps >= args.steps:
                 if is_main_process(rank):
-                    print(f"[Train] Reached {args.steps:,d} steps. Done.")
+                    log(f"[Train] Reached {args.steps:,d} steps. Done.")
                     ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}_final.pt'
-                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch)
+                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase)
                 cleanup_distributed()
                 return
 
@@ -449,6 +517,12 @@ def main():
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--log_interval', type=int, default=100)
     parser.add_argument('--save_interval', type=int, default=5000)
+    parser.add_argument('--keep_last_checkpoints', type=int, default=3,
+                        help='Number of periodic checkpoints to keep on disk. '
+                             'Older ones are pruned. 0 = keep all. Final checkpoint is always kept.')
+    parser.add_argument('--grad_clip', type=float, default=1000.0,
+                        help='Gradient norm clipping threshold. 0 = disabled. '
+                             'Default 1000 matches BigVGAN reference config.')
     args = parser.parse_args()
 
     train(args)

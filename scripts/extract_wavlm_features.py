@@ -102,24 +102,29 @@ def fast_cosine_dist(source_feats, matching_pool):
 
 
 @torch.inference_mode()
-def knn_prematch(source_feats, matching_pool, topk=4):
+def knn_prematch(source_feats, matching_pool, topk=4, query_chunk=1024):
     """Apply kNN regression to replace source features with prematched features.
 
     For each frame in source_feats, find the top-k nearest neighbors in matching_pool
-    by cosine distance and average them.
+    by cosine distance and average them. Computed on whatever device the inputs
+    live on; chunk the query dim to cap peak memory on large pools.
 
     Args:
         source_feats: (src_len, 1024)
         matching_pool: (pool_len, 1024)
         topk: number of neighbors
+        query_chunk: max number of query frames to process at once
 
     Returns:
-        prematched: (src_len, 1024)
+        prematched: (src_len, 1024) on the same device as inputs
     """
-    dists = fast_cosine_dist(source_feats, matching_pool)
-    best = dists.topk(k=topk, dim=-1, largest=False)  # (src_len, topk)
-    prematched = matching_pool[best.indices].mean(dim=1)  # (src_len, 1024)
-    return prematched
+    outputs = []
+    for start in range(0, source_feats.shape[0], query_chunk):
+        chunk = source_feats[start:start + query_chunk]
+        dists = fast_cosine_dist(chunk, matching_pool)      # (chunk, pool_len)
+        best = dists.topk(k=topk, dim=-1, largest=False)    # (chunk, topk)
+        outputs.append(matching_pool[best.indices].mean(dim=1))
+    return torch.cat(outputs, dim=0)
 
 
 def extract_all(args):
@@ -156,7 +161,7 @@ def extract_all(args):
 
         try:
             feats = extract_features(model, wav_path, device)
-            torch.save(feats, out_path)
+            torch.save(feats.half(), out_path)
             processed += 1
 
             if (processed + skipped) % 100 == 0 or i == len(audio_files) - 1:
@@ -230,12 +235,13 @@ def extract_prematched(args):
 
         print(f"\n[Speaker {spk_idx+1}/{len(speaker_files)}] {spk} — {len(files)} utterances")
 
-        # Pass 1: Extract raw features for this speaker
-        raw_feats = {}  # wav_path -> (seq_len, 1024)
+        # Pass 1: Extract raw features for this speaker (stored as fp16 on CPU
+        # to halve memory — upcast to fp32 when moving to GPU for kNN).
+        raw_feats = {}  # wav_path -> (seq_len, 1024) fp16 CPU tensor
         for wav_path in files:
             try:
                 feats = extract_features(model, wav_path, device)
-                raw_feats[wav_path] = feats
+                raw_feats[wav_path] = feats.half()
             except Exception as e:
                 total_errors += 1
                 print(f"  ERROR extracting {wav_path.name}: {e}")
@@ -245,12 +251,22 @@ def extract_prematched(args):
             for wav_path, feats in raw_feats.items():
                 out_path = out_dir / wav_path.relative_to(audio_dir).with_suffix('.pt')
                 out_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save(feats, out_path)
+                torch.save(feats.half(), out_path)
                 total_processed += 1
             continue
 
+        # Build the full speaker pool once (on GPU if available) and mask out
+        # the current utterance's frames when prematching each query. This avoids
+        # re-concatenating a large tensor for every utterance.
+        all_paths = list(raw_feats.keys())
+        offsets = [0]
+        for p in all_paths:
+            offsets.append(offsets[-1] + raw_feats[p].shape[0])
+        full_pool = torch.cat([raw_feats[p].float() for p in all_paths], dim=0).to(device)  # (N_total, 1024)
+        pool_len = full_pool.shape[0]
+
         # Pass 2: For each utterance, prematch against all other utterances from same speaker
-        for wav_path, source_feats in raw_feats.items():
+        for idx, wav_path in enumerate(all_paths):
             out_path = out_dir / wav_path.relative_to(audio_dir).with_suffix('.pt')
 
             if args.skip_existing and out_path.exists():
@@ -259,18 +275,27 @@ def extract_prematched(args):
 
             out_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # Build matching pool from all other utterances of this speaker
-            pool_parts = [f for p, f in raw_feats.items() if p != wav_path]
-            matching_pool = torch.cat(pool_parts, dim=0)  # (pool_len, 1024)
+            # Exclude this utterance's frames from the pool by slicing around them
+            start, end = offsets[idx], offsets[idx + 1]
+            if start == 0:
+                matching_pool = full_pool[end:]
+            elif end == pool_len:
+                matching_pool = full_pool[:start]
+            else:
+                matching_pool = torch.cat([full_pool[:start], full_pool[end:]], dim=0)
 
+            source_feats = raw_feats[wav_path].float().to(device)
             prematched = knn_prematch(source_feats, matching_pool, topk=args.topk)
-            torch.save(prematched, out_path)
+            # Save as float16 to halve disk usage; dataset upcasts to float32 at load.
+            torch.save(prematched.half().cpu(), out_path)
             total_processed += 1
 
-        print(f"  Done. Pool size: {matching_pool.shape[0]:,d} frames")
+        print(f"  Done. Pool size: {pool_len:,d} frames")
 
         # Free memory between speakers
-        del raw_feats, matching_pool
+        del raw_feats, full_pool
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
         gc.collect()
 
     print(f"\nDone. Processed: {total_processed}, Skipped: {total_skipped}, Errors: {total_errors}")
