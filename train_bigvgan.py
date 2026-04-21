@@ -47,6 +47,7 @@ Dataset format:
 """
 
 import argparse
+import contextlib
 import itertools
 import math
 import os
@@ -533,9 +534,26 @@ def train(args):
         sw = SummaryWriter(os.path.join(args.checkpoint_dir, 'logs'))
 
     # ── Training loop ─────────────────────────────────────────────────────────
+    if is_main_process(rank):
+        eff_bs = args.batch_size * world_size * args.accumulation_steps
+        log(f"[Train] Effective batch size: {args.batch_size} x {world_size} GPUs x "
+            f"{args.accumulation_steps} accum = {eff_bs}")
+
     vocoder.train()
     mpd.train()
     mrd.train()
+
+    accum_steps = args.accumulation_steps
+    use_ddp = world_size > 1
+
+    # no_sync() skips DDP all-reduce on intermediate micro-batches
+    def maybe_no_sync(model, is_last):
+        if use_ddp and not is_last:
+            return model.no_sync()
+        return contextlib.nullcontext()
+
+    optim_d.zero_grad()
+    optim_g.zero_grad()
 
     for epoch in range(start_epoch, 10000):
         if isinstance(sampler, DistributedSampler):
@@ -551,9 +569,17 @@ def train(args):
                 pin_memory=(device.type == 'cuda'),
             )
 
+        micro = 0
+        accum_loss_g = 0.0
+        accum_loss_d = 0.0
+        accum_loss_mel = 0.0
+        accum_loss_fm = 0.0
+
         for feats, wav_real in loader:
             feats = feats.to(device)       # (B, frames, 1024)
             wav_real = wav_real.to(device).unsqueeze(1)  # (B, 1, T)
+            micro += 1
+            is_last_micro = (micro % accum_steps == 0)
 
             # Forward pass: WavLM features → synthesized audio (at 24kHz, no resample)
             wav_gen = vocoder(feats)  # (B, 1, T')
@@ -564,43 +590,37 @@ def train(args):
             wav_gen = wav_gen[..., :min_len]
 
             # ── Discriminator update ────────────────────────────────────────
-            optim_d.zero_grad()
+            with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
+                y_df_r, y_df_g, _, _ = mpd(wav_real, wav_gen.detach())
+                loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
 
-            y_df_r, y_df_g, _, _ = mpd(wav_real, wav_gen.detach())
-            loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
+                y_dr_r, y_dr_g, _, _ = mrd(wav_real, wav_gen.detach())
+                loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
 
-            y_dr_r, y_dr_g, _, _ = mrd(wav_real, wav_gen.detach())
-            loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
-
-            loss_d = loss_d_mpd + loss_d_mrd
-            loss_d.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    itertools.chain(mpd.parameters(), mrd.parameters()),
-                    args.grad_clip,
-                )
-            optim_d.step()
+                loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
+                loss_d.backward()
 
             # ── Generator update ────────────────────────────────────────────
-            optim_g.zero_grad()
+            with maybe_no_sync(vocoder, is_last_micro), \
+                 maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
+                loss_mel = mel_loss_fn(wav_gen, wav_real)
 
-            # Mel-spectrogram loss (multi-scale)
-            loss_mel = mel_loss_fn(wav_gen, wav_real)
+                y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wav_real, wav_gen)
+                y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wav_real, wav_gen)
 
-            # Adversarial + feature matching losses
-            y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wav_real, wav_gen)
-            y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wav_real, wav_gen)
+                loss_fm_mpd = feature_loss(fmap_f_r, fmap_f_g)
+                loss_fm_mrd = feature_loss(fmap_r_r, fmap_r_g)
+                loss_gen_mpd, _ = generator_loss(y_df_g)
+                loss_gen_mrd, _ = generator_loss(y_dr_g)
 
-            loss_fm_mpd = feature_loss(fmap_f_r, fmap_f_g)
-            loss_fm_mrd = feature_loss(fmap_r_r, fmap_r_g)
-            loss_gen_mpd, _ = generator_loss(y_df_g)
-            loss_gen_mrd, _ = generator_loss(y_dr_g)
+                loss_g = (loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
+                loss_g.backward()
 
-            loss_g = loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd
-            loss_g.backward()
-            if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
-            optim_g.step()
+            # Track unscaled losses for logging
+            accum_loss_d += loss_d.item() * accum_steps
+            accum_loss_g += loss_g.item() * accum_steps
+            accum_loss_mel += loss_mel.item()
+            accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
 
             # Stop training immediately if we hit a non-finite loss — for long
             # runs this saves hours of wasted compute chasing NaNs.
@@ -611,17 +631,41 @@ def train(args):
                 cleanup_distributed()
                 return
 
+            if not is_last_micro:
+                continue
+
+            # ── Optimizer step (every accum_steps micro-batches) ───────────
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    itertools.chain(mpd.parameters(), mrd.parameters()),
+                    args.grad_clip,
+                )
+                torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
+            optim_d.step()
+            optim_g.step()
+            optim_d.zero_grad()
+            optim_g.zero_grad()
+
             # ── Logging (main process only) ─────────────────────────────────
             if is_main_process(rank) and steps % args.log_interval == 0:
+                avg_mel = accum_loss_mel / accum_steps
+                avg_fm = accum_loss_fm / accum_steps
+                avg_g = accum_loss_g / accum_steps
+                avg_d = accum_loss_d / accum_steps
                 log(
                     f"Step {steps:,d} | "
-                    f"G={loss_g.item():.3f} mel={loss_mel.item():.3f} "
-                    f"fm={loss_fm_mpd.item()+loss_fm_mrd.item():.3f} "
-                    f"D={loss_d.item():.3f}"
+                    f"G={avg_g:.3f} mel={avg_mel:.3f} "
+                    f"fm={avg_fm:.3f} "
+                    f"D={avg_d:.3f}"
                 )
-                sw.add_scalar('train/loss_g', loss_g.item(), steps)
-                sw.add_scalar('train/loss_mel', loss_mel.item(), steps)
-                sw.add_scalar('train/loss_d', loss_d.item(), steps)
+                sw.add_scalar('train/loss_g', avg_g, steps)
+                sw.add_scalar('train/loss_mel', avg_mel, steps)
+                sw.add_scalar('train/loss_d', avg_d, steps)
+
+            accum_loss_g = 0.0
+            accum_loss_d = 0.0
+            accum_loss_mel = 0.0
+            accum_loss_fm = 0.0
 
             # ── Checkpoint (main process only) ──────────────────────────────
             if is_main_process(rank) and steps % args.save_interval == 0 and steps > 0:
@@ -646,6 +690,12 @@ def train(args):
                     save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase)
                 cleanup_distributed()
                 return
+
+        # Discard leftover micro-batches that didn't complete a full
+        # accumulation window — partial averages would skew the update.
+        if micro % accum_steps != 0:
+            optim_d.zero_grad()
+            optim_g.zero_grad()
 
         scheduler_g.step()
         scheduler_d.step()
@@ -675,6 +725,9 @@ def main():
     parser.add_argument('--keep_last_checkpoints', type=int, default=3,
                         help='Number of periodic checkpoints to keep on disk. '
                              'Older ones are pruned. 0 = keep all. Final checkpoint is always kept.')
+    parser.add_argument('--accumulation_steps', type=int, default=1,
+                        help='Number of micro-batches to accumulate before each optimizer step. '
+                             'Effective batch size = batch_size * num_gpus * accumulation_steps.')
     parser.add_argument('--grad_clip', type=float, default=1000.0,
                         help='Gradient norm clipping threshold. 0 = disabled. '
                              'Default 1000 matches BigVGAN reference config.')
