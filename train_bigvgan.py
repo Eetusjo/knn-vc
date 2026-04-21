@@ -116,12 +116,14 @@ def log(msg):
 class WavLMVocoderDataset(Dataset):
     """Paired (WavLM features, audio waveform) dataset for BigVGAN fine-tuning.
 
-    Expects:
-      - audio_dir: directory tree of .wav files at target_sr
-      - feat_dir: directory tree of .pt files (WavLM layer-6 features, shape (seq_len, 1024))
-        with the same relative paths as audio files but .pt extension
+    Expects one or more (audio_dir, feat_dir) pairs. Each feat_dir contains .pt files
+    (WavLM layer-6 features, shape (seq_len, 1024)) with the same relative paths as
+    the corresponding audio files but with .pt extension.
 
     Segment size is in samples at target_sr. Features are trimmed/padded to match.
+
+    When supplementary directories are provided, `group_indices` tracks which samples
+    belong to the primary (0) vs supplementary (1) group for weighted sampling.
     """
 
     AUDIO_EXTS = ('.wav', '.flac', '.mp3', '.ogg', '.opus')
@@ -130,34 +132,24 @@ class WavLMVocoderDataset(Dataset):
         self,
         audio_dir: Path,
         feat_dir: Path,
+        supplementary_dirs: list[tuple[Path, Path]] | None = None,
         segment_size: int = 24000 * 1,  # 1 second at 24kHz
         target_sr: int = 24000,
         wavlm_frame_rate: int = 50,  # 50 frames/sec = 20ms hop
         split: bool = True,
     ):
-        self.audio_dir = Path(audio_dir)
-        self.feat_dir = Path(feat_dir)
         self.segment_size = segment_size
         self.target_sr = target_sr
         self.wavlm_frame_rate = wavlm_frame_rate
         self.split = split
         self.frames_per_seg = math.ceil(segment_size / target_sr * wavlm_frame_rate)
 
-        # Find all paired files (audio extension is discovered, not assumed)
         self.pairs = []
-        missing_audio = 0
-        for feat_path in sorted(self.feat_dir.rglob('*.pt')):
-            rel_no_ext = feat_path.relative_to(self.feat_dir).with_suffix('')
-            audio_path = None
-            for ext in self.AUDIO_EXTS:
-                candidate = self.audio_dir / rel_no_ext.with_suffix(ext)
-                if candidate.exists():
-                    audio_path = candidate
-                    break
-            if audio_path is not None:
-                self.pairs.append((audio_path, feat_path))
-            else:
-                missing_audio += 1
+        self.group_of = []  # 0 = primary, 1 = supplementary
+
+        self._scan_dirs(Path(audio_dir), Path(feat_dir), group=0)
+        for sup_audio, sup_feat in (supplementary_dirs or []):
+            self._scan_dirs(Path(sup_audio), Path(sup_feat), group=1)
 
         if len(self.pairs) == 0:
             raise ValueError(
@@ -166,9 +158,32 @@ class WavLMVocoderDataset(Dataset):
                 f"  feat_dir: {feat_dir}\n"
                 "Run scripts/extract_wavlm_features.py first."
             )
+
+        n_primary = self.group_of.count(0)
+        n_supp = self.group_of.count(1)
+        log(f"[Dataset] {n_primary:,d} primary + {n_supp:,d} supplementary = {len(self.pairs):,d} total pairs.")
+
+    def _scan_dirs(self, audio_dir: Path, feat_dir: Path, group: int):
+        missing_audio = 0
+        found = 0
+        for feat_path in sorted(feat_dir.rglob('*.pt')):
+            rel_no_ext = feat_path.relative_to(feat_dir).with_suffix('')
+            audio_path = None
+            for ext in self.AUDIO_EXTS:
+                candidate = audio_dir / rel_no_ext.with_suffix(ext)
+                if candidate.exists():
+                    audio_path = candidate
+                    break
+            if audio_path is not None:
+                self.pairs.append((audio_path, feat_path))
+                self.group_of.append(group)
+                found += 1
+            else:
+                missing_audio += 1
         if missing_audio:
-            log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio file.")
-        log(f"[Dataset] Found {len(self.pairs):,d} paired files.")
+            log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio in {audio_dir}.")
+        label = "primary" if group == 0 else "supplementary"
+        log(f"[Dataset] Found {found:,d} paired files in {feat_dir} ({label}).")
 
     def __len__(self):
         return len(self.pairs)
@@ -219,6 +234,48 @@ class WavLMVocoderDataset(Dataset):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Weighted sampler for supplementary data
+# ──────────────────────────────────────────────────────────────────────────────
+
+def make_weighted_sampler(dataset, supplementary_weight, rank=0, world_size=1, epoch=0):
+    """Build a WeightedRandomSampler that oversamples supplementary data.
+
+    Args:
+        dataset: WavLMVocoderDataset with group_of attribute.
+        supplementary_weight: Target fraction of supplementary data per epoch (0.0-1.0).
+            E.g. 0.15 means ~15% of samples per epoch come from supplementary data.
+        rank, world_size: For distributed training, each rank gets a disjoint subset.
+        epoch: Used as random seed offset for reproducibility across epochs.
+    """
+    n_primary = dataset.group_of.count(0)
+    n_supp = dataset.group_of.count(1)
+
+    if n_supp == 0 or supplementary_weight <= 0:
+        return None
+
+    # Per-sample weights so that P(supplementary) = supplementary_weight in expectation.
+    # With n_prim samples at weight w_prim and n_supp at w_supp:
+    #   P(supp) = n_supp * w_supp / (n_prim * w_prim + n_supp * w_supp) = supplementary_weight
+    w_prim = 1.0
+    w_supp = (supplementary_weight * n_primary) / ((1 - supplementary_weight) * n_supp)
+
+    weights = [w_supp if g == 1 else w_prim for g in dataset.group_of]
+    weights = torch.tensor(weights, dtype=torch.double)
+
+    n_samples = len(dataset)
+
+    if world_size > 1:
+        # Each rank draws n_samples // world_size samples with the same weights
+        # but different random seeds, giving disjoint-in-expectation subsets.
+        n_samples = math.ceil(len(dataset) / world_size)
+        g = torch.Generator()
+        g.manual_seed(epoch * world_size + rank)
+        return torch.utils.data.WeightedRandomSampler(weights, num_samples=n_samples, replacement=True, generator=g)
+
+    return torch.utils.data.WeightedRandomSampler(weights, num_samples=n_samples, replacement=True)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -264,6 +321,47 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
             old.unlink()
         except OSError:
             pass
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation
+# ──────────────────────────────────────────────────────────────────────────────
+
+@torch.no_grad()
+def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samples=4):
+    """Run validation: compute mel loss over the val set, log to TensorBoard."""
+    vocoder.eval()
+
+    total_mel = 0.0
+    n_batches = 0
+    audio_logged = 0
+
+    for feats, wav_real in val_loader:
+        feats = feats.to(device)
+        wav_real = wav_real.to(device).unsqueeze(1)
+
+        wav_gen = vocoder(feats)
+
+        min_len = min(wav_real.shape[-1], wav_gen.shape[-1])
+        wav_real = wav_real[..., :min_len]
+        wav_gen = wav_gen[..., :min_len]
+
+        total_mel += mel_loss_fn(wav_gen, wav_real).item()
+        n_batches += 1
+
+        if sw is not None and audio_logged < num_audio_samples:
+            for j in range(min(feats.shape[0], num_audio_samples - audio_logged)):
+                sw.add_audio(f'val/gen_{audio_logged}', wav_gen[j], steps, sample_rate=24000)
+                sw.add_audio(f'val/real_{audio_logged}', wav_real[j], steps, sample_rate=24000)
+                audio_logged += 1
+
+    val_mel = total_mel / max(n_batches, 1)
+
+    if sw is not None:
+        sw.add_scalar('val/loss_mel', val_mel, steps)
+
+    vocoder.train()
+    return val_mel
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -371,14 +469,32 @@ def train(args):
 
     # ── Dataset ───────────────────────────────────────────────────────────────
     segment_size = h.sampling_rate * args.segment_seconds  # samples at 24kHz
+
+    supplementary_dirs = None
+    if args.supplementary_dirs:
+        supplementary_dirs = []
+        for pair in args.supplementary_dirs:
+            a_dir, f_dir = pair.split(':')
+            supplementary_dirs.append((Path(a_dir), Path(f_dir)))
+
     dataset = WavLMVocoderDataset(
         audio_dir=args.audio_dir,
         feat_dir=args.feat_dir,
+        supplementary_dirs=supplementary_dirs,
         segment_size=segment_size,
         target_sr=h.sampling_rate,
     )
 
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True) if world_size > 1 else None
+    has_supplementary = dataset.group_of.count(1) > 0
+    if has_supplementary:
+        sampler = make_weighted_sampler(dataset, args.supplementary_weight, rank, world_size)
+        if is_main_process(rank):
+            log(f"[Train] Weighted sampling: supplementary target weight = {args.supplementary_weight:.0%}")
+    elif world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        sampler = None
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -388,6 +504,27 @@ def train(args):
         drop_last=True,
         pin_memory=(device.type == 'cuda'),
     )
+
+    # ── Validation dataset ──────────────────────────────────────────────────
+    val_loader = None
+    if args.val_audio_dir and args.val_feat_dir:
+        val_dataset = WavLMVocoderDataset(
+            audio_dir=args.val_audio_dir,
+            feat_dir=args.val_feat_dir,
+            segment_size=segment_size,
+            target_sr=h.sampling_rate,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            drop_last=False,
+            pin_memory=(device.type == 'cuda'),
+        )
+        if is_main_process(rank):
+            log(f"[Train] Validation enabled: {len(val_dataset):,d} samples, "
+                f"running every {args.val_interval:,d} steps.")
 
     # ── Tensorboard (main process only) ───────────────────────────────────────
     sw = None
@@ -401,8 +538,18 @@ def train(args):
     mrd.train()
 
     for epoch in range(start_epoch, 10000):
-        if sampler is not None:
+        if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
+        elif has_supplementary:
+            sampler = make_weighted_sampler(dataset, args.supplementary_weight, rank, world_size, epoch)
+            loader = DataLoader(
+                dataset,
+                batch_size=args.batch_size,
+                sampler=sampler,
+                num_workers=args.num_workers,
+                drop_last=True,
+                pin_memory=(device.type == 'cuda'),
+            )
 
         for feats, wav_real in loader:
             feats = feats.to(device)       # (B, frames, 1024)
@@ -483,6 +630,14 @@ def train(args):
                 log(f"[Train] Saved checkpoint: {ckpt_path}")
                 prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
+            # ── Validation (main process only) ─────────────────────────────
+            if (val_loader is not None
+                    and is_main_process(rank)
+                    and steps % args.val_interval == 0
+                    and steps > 0):
+                val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps)
+                log(f"[Val] Step {steps:,d} | val_mel={val_mel:.3f}")
+
             steps += 1
             if steps >= args.steps:
                 if is_main_process(rank):
@@ -523,6 +678,19 @@ def main():
     parser.add_argument('--grad_clip', type=float, default=1000.0,
                         help='Gradient norm clipping threshold. 0 = disabled. '
                              'Default 1000 matches BigVGAN reference config.')
+    parser.add_argument('--val_audio_dir', default=None,
+                        help='Root directory of validation .wav files')
+    parser.add_argument('--val_feat_dir', default=None,
+                        help='Root directory of validation .pt WavLM feature files')
+    parser.add_argument('--val_interval', type=int, default=5000,
+                        help='Run validation every N steps (default: 5000)')
+    parser.add_argument('--supplementary_dirs', nargs='*', metavar='AUDIO:FEAT',
+                        help='Additional data directories as audio_dir:feat_dir pairs. '
+                             'These are oversampled to the target weight. '
+                             'Example: --supplementary_dirs /data/vocalsound:/data/vocalsound-feats '
+                             '/data/emovdb:/data/emovdb-feats')
+    parser.add_argument('--supplementary_weight', type=float, default=0.15,
+                        help='Target fraction of supplementary data per epoch (default: 0.15 = 15%%).')
     args = parser.parse_args()
 
     train(args)
