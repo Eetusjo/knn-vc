@@ -507,7 +507,7 @@ def train(args):
     )
 
     has_supplementary = dataset.group_of.count(1) > 0
-    if has_supplementary:
+    if has_supplementary and args.supplementary_weight > 0:
         sampler = make_weighted_sampler(dataset, args.supplementary_weight, rank, world_size)
         if is_main_process(rank):
             log(f"[Train] Weighted sampling: supplementary target weight = {args.supplementary_weight:.0%}")
@@ -579,7 +579,7 @@ def train(args):
     for epoch in range(start_epoch, 10000):
         if isinstance(sampler, DistributedSampler):
             sampler.set_epoch(epoch)
-        elif has_supplementary:
+        elif has_supplementary and args.supplementary_weight > 0:
             sampler = make_weighted_sampler(dataset, args.supplementary_weight, rank, world_size, epoch)
             loader = DataLoader(
                 dataset,
