@@ -337,7 +337,9 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
 @torch.no_grad()
 def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samples=4):
     """Run validation: compute mel loss over the val set, log to TensorBoard."""
-    vocoder.eval()
+    # Use the unwrapped module to avoid DDP collective ops (only rank 0 runs validation)
+    model = vocoder.module if hasattr(vocoder, 'module') else vocoder
+    model.eval()
 
     total_mel = 0.0
     n_batches = 0
@@ -347,7 +349,8 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samp
         feats = feats.to(device)
         wav_real = wav_real.to(device).unsqueeze(1)
 
-        wav_gen = vocoder(feats)
+        with torch.no_grad():
+            wav_gen = model(feats)
 
         min_len = min(wav_real.shape[-1], wav_gen.shape[-1])
         wav_real = wav_real[..., :min_len]
@@ -367,7 +370,7 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samp
     if sw is not None:
         sw.add_scalar('val/loss_mel', val_mel, steps)
 
-    vocoder.train()
+    model.train()
     return val_mel
 
 
