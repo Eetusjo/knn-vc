@@ -268,10 +268,16 @@ def extract_prematched(args):
         # Pass 1: Extract raw features for this speaker (stored as fp16 on CPU
         # to halve memory — upcast to fp32 when moving to GPU for kNN).
         raw_feats = {}  # wav_path -> (seq_len, 1024) fp16 CPU tensor
-        for wav_path in files:
+        t_spk = time.monotonic()
+        for fi, wav_path in enumerate(files):
             try:
                 feats = extract_features(model, wav_path, device)
                 raw_feats[wav_path] = feats.half()
+                if (fi + 1) % 50 == 0 or fi == len(files) - 1:
+                    spk_elapsed = time.monotonic() - t_spk
+                    spk_rate = (fi + 1) / spk_elapsed if spk_elapsed > 0 else 0
+                    spk_eta = (len(files) - fi - 1) / spk_rate if spk_rate > 0 else -1
+                    print(f"  extract [{fi+1}/{len(files)}] {spk_rate:.1f} files/s, ETA {fmt_eta(spk_eta)}")
             except Exception as e:
                 total_errors += 1
                 print(f"  ERROR extracting {wav_path.name}: {e}")
@@ -296,6 +302,8 @@ def extract_prematched(args):
         pool_len = full_pool.shape[0]
 
         # Pass 2: For each utterance, prematch against all other utterances from same speaker
+        t_pm = time.monotonic()
+        pm_done = 0
         for idx, wav_path in enumerate(all_paths):
             out_path = out_dir / wav_path.relative_to(audio_dir).with_suffix('.pt')
 
@@ -319,6 +327,13 @@ def extract_prematched(args):
             # Save as float16 to halve disk usage; dataset upcasts to float32 at load.
             torch.save(prematched.half().cpu(), out_path)
             total_processed += 1
+            pm_done += 1
+            if pm_done % 50 == 0 or idx == len(all_paths) - 1:
+                pm_elapsed = time.monotonic() - t_pm
+                pm_rate = pm_done / pm_elapsed if pm_elapsed > 0 else 0
+                pm_remaining = len(all_paths) - idx - 1
+                pm_eta = pm_remaining / pm_rate if pm_rate > 0 else -1
+                print(f"  prematch [{idx+1}/{len(all_paths)}] {pm_rate:.1f} files/s, ETA {fmt_eta(pm_eta)}")
 
         speakers_done += 1
         print(f"  Done. Pool size: {pool_len:,d} frames")
