@@ -39,6 +39,7 @@ Already-extracted files are skipped (resumable).
 import argparse
 import gc
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -127,6 +128,16 @@ def knn_prematch(source_feats, matching_pool, topk=4, query_chunk=1024):
     return torch.cat(outputs, dim=0)
 
 
+def fmt_eta(seconds):
+    if seconds < 0:
+        return "?"
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
+
+
 def extract_all(args):
     """Extract features for all files, without prematching."""
     audio_dir = Path(args.audio_dir)
@@ -148,6 +159,7 @@ def extract_all(args):
     skipped = 0
     processed = 0
     errors = 0
+    t0 = time.monotonic()
 
     for i, wav_path in enumerate(audio_files):
         rel_path = wav_path.relative_to(audio_dir).with_suffix('.pt')
@@ -165,16 +177,23 @@ def extract_all(args):
             processed += 1
 
             if (processed + skipped) % 100 == 0 or i == len(audio_files) - 1:
+                elapsed = time.monotonic() - t0
+                done = i + 1
+                remaining = len(audio_files) - done
+                rate = done / elapsed if elapsed > 0 else 0
+                eta = remaining / rate if rate > 0 else -1
                 print(
-                    f"[{i+1}/{len(audio_files)}] "
+                    f"[{done}/{len(audio_files)}] "
                     f"processed={processed} skipped={skipped} errors={errors} | "
-                    f"{wav_path.name} → shape {tuple(feats.shape)}"
+                    f"{wav_path.name} → {tuple(feats.shape)} | "
+                    f"{rate:.1f} files/s, ETA {fmt_eta(eta)}"
                 )
         except Exception as e:
             errors += 1
             print(f"ERROR processing {wav_path}: {e}")
 
-    print(f"\nDone. Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
+    elapsed = time.monotonic() - t0
+    print(f"\nDone in {fmt_eta(elapsed)}. Processed: {processed}, Skipped: {skipped}, Errors: {errors}")
     print(f"Features saved to: {out_dir}")
 
 
@@ -222,6 +241,9 @@ def extract_prematched(args):
     total_processed = 0
     total_skipped = 0
     total_errors = 0
+    n_speakers = len(speaker_files)
+    t0 = time.monotonic()
+    speakers_done = 0
 
     for spk_idx, (spk, files) in enumerate(sorted(speaker_files.items())):
         # Check if all outputs for this speaker already exist
@@ -231,9 +253,17 @@ def extract_prematched(args):
         )
         if args.skip_existing and all_exist:
             total_skipped += len(files)
+            speakers_done += 1
             continue
 
-        print(f"\n[Speaker {spk_idx+1}/{len(speaker_files)}] {spk} — {len(files)} utterances")
+        elapsed = time.monotonic() - t0
+        if speakers_done > 0:
+            rate = speakers_done / elapsed
+            eta = (n_speakers - spk_idx) / rate
+            eta_str = f" | ETA {fmt_eta(eta)}"
+        else:
+            eta_str = ""
+        print(f"\n[Speaker {spk_idx+1}/{n_speakers}] {spk} — {len(files)} utterances{eta_str}")
 
         # Pass 1: Extract raw features for this speaker (stored as fp16 on CPU
         # to halve memory — upcast to fp32 when moving to GPU for kNN).
@@ -290,6 +320,7 @@ def extract_prematched(args):
             torch.save(prematched.half().cpu(), out_path)
             total_processed += 1
 
+        speakers_done += 1
         print(f"  Done. Pool size: {pool_len:,d} frames")
 
         # Free memory between speakers
@@ -298,7 +329,8 @@ def extract_prematched(args):
             torch.cuda.empty_cache()
         gc.collect()
 
-    print(f"\nDone. Processed: {total_processed}, Skipped: {total_skipped}, Errors: {total_errors}")
+    elapsed = time.monotonic() - t0
+    print(f"\nDone in {fmt_eta(elapsed)}. Processed: {total_processed}, Skipped: {total_skipped}, Errors: {total_errors}")
     print(f"Prematched features saved to: {out_dir}")
 
 
