@@ -138,12 +138,14 @@ class WavLMVocoderDataset(Dataset):
         target_sr: int = 24000,
         wavlm_frame_rate: int = 50,  # 50 frames/sec = 20ms hop
         split: bool = True,
+        verbose: bool = True,
     ):
         self.segment_size = segment_size
         self.target_sr = target_sr
         self.wavlm_frame_rate = wavlm_frame_rate
         self.split = split
         self.frames_per_seg = math.ceil(segment_size / target_sr * wavlm_frame_rate)
+        self._verbose = verbose
 
         self.pairs = []
         self.group_of = []  # 0 = primary, 1 = supplementary
@@ -162,7 +164,8 @@ class WavLMVocoderDataset(Dataset):
 
         n_primary = self.group_of.count(0)
         n_supp = self.group_of.count(1)
-        log(f"[Dataset] {n_primary:,d} primary + {n_supp:,d} supplementary = {len(self.pairs):,d} total pairs.")
+        if self._verbose:
+            log(f"[Dataset] {n_primary:,d} primary + {n_supp:,d} supplementary = {len(self.pairs):,d} total pairs.")
 
     def _scan_dirs(self, audio_dir: Path, feat_dir: Path, group: int):
         missing_audio = 0
@@ -181,10 +184,11 @@ class WavLMVocoderDataset(Dataset):
                 found += 1
             else:
                 missing_audio += 1
-        if missing_audio:
-            log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio in {audio_dir}.")
-        label = "primary" if group == 0 else "supplementary"
-        log(f"[Dataset] Found {found:,d} paired files in {feat_dir} ({label}).")
+        if self._verbose:
+            if missing_audio:
+                log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio in {audio_dir}.")
+            label = "primary" if group == 0 else "supplementary"
+            log(f"[Dataset] Found {found:,d} paired files in {feat_dir} ({label}).")
 
     def __len__(self):
         return len(self.pairs)
@@ -499,6 +503,7 @@ def train(args):
         supplementary_dirs=supplementary_dirs,
         segment_size=segment_size,
         target_sr=h.sampling_rate,
+        verbose=is_main_process(rank),
     )
 
     has_supplementary = dataset.group_of.count(1) > 0
@@ -529,6 +534,7 @@ def train(args):
             feat_dir=args.val_feat_dir,
             segment_size=segment_size,
             target_sr=h.sampling_rate,
+            verbose=is_main_process(rank),
         )
         val_loader = DataLoader(
             val_dataset,
