@@ -13,7 +13,7 @@ from wavlm.WavLM import WavLM, WavLMConfig
 from hifigan.models import Generator as HiFiGAN
 from hifigan.utils import AttrDict
 from matcher import KNeighborsVC
-from bigvgan_vocoder import BigVGANVocoder
+from bigvgan_vocoder import BigVGANVocoder, build_projection
 
 
 def knn_vc(pretrained=True, progress=True, prematched=True, device='cuda',
@@ -97,17 +97,17 @@ def bigvgan_wavlm(pretrained=True, device='cuda', checkpoint_path=None):
         map_location=str(device),
     )
 
-    # Create projection layer: WavLM 1024-dim → BigVGAN num_mels (100)
-    projection = nn.Linear(1024, model.h.num_mels)
-
     # Load fine-tuned weights if a checkpoint is provided
     if checkpoint_path is not None:
         ckpt = torch.load(checkpoint_path, map_location=device)
+        proj_type = ckpt.get('projection_type', 'linear')
+        projection = build_projection(proj_type, in_dim=1024, out_dim=model.h.num_mels)
         projection.load_state_dict(ckpt['projection'])
         if 'bigvgan' in ckpt:
             model.load_state_dict(ckpt['bigvgan'])
-        print(f"[BigVGAN] Loaded fine-tuned checkpoint from {checkpoint_path}")
+        print(f"[BigVGAN] Loaded fine-tuned checkpoint from {checkpoint_path} (projection: {proj_type})")
     else:
+        projection = build_projection('linear', in_dim=1024, out_dim=model.h.num_mels)
         print("[BigVGAN] Using pretrained BigVGAN with randomly initialized projection layer.")
         print("[BigVGAN] Note: fine-tune with train_bigvgan.py for good quality.")
 

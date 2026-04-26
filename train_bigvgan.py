@@ -77,7 +77,7 @@ from bigvgan.loss import (
     feature_loss,
     generator_loss,
 )
-from bigvgan_vocoder import BigVGANVocoder
+from bigvgan_vocoder import BigVGANVocoder, build_projection
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -280,7 +280,8 @@ def make_weighted_sampler(dataset, supplementary_weight, rank=0, world_size=1, e
 # Checkpoint helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
-def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, phase):
+def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, phase,
+                    projection_type='linear'):
     # Unwrap DDP modules to save the underlying state_dict
     def unwrap(m):
         return m.module if isinstance(m, DDP) else m
@@ -290,6 +291,7 @@ def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, pha
     tmp_path = str(path) + '.tmp'
     torch.save({
         'projection': unwrap(vocoder).projection.state_dict(),
+        'projection_type': projection_type,
         'bigvgan': unwrap(vocoder).bigvgan.state_dict(),
         'mpd': unwrap(mpd).state_dict(),
         'mrd': unwrap(mrd).state_dict(),
@@ -391,8 +393,11 @@ def train(args):
     )
     h = bigvgan_model.h  # hyperparams: sampling_rate=24000, num_mels=100, hop_size=256, ...
 
-    projection = nn.Linear(1024, h.num_mels)
+    projection = build_projection(args.projection, in_dim=1024, out_dim=h.num_mels)
     vocoder = BigVGANVocoder(bigvgan_model, projection, target_sr=h.sampling_rate).to(device)
+    if is_main_process(rank):
+        n_proj = sum(p.numel() for p in projection.parameters())
+        log(f"[Train] Projection: {args.projection} ({n_proj:,d} params)")
 
     # ── Discriminators (match BigVGAN-v2 config) ─────────────────────────────
     mpd = MultiPeriodDiscriminator(h).to(device)
@@ -410,6 +415,11 @@ def train(args):
     resumed_phase = None
     if args.resume:
         ckpt = load_checkpoint(args.resume, device)
+        ckpt_proj_type = ckpt.get('projection_type', 'linear')
+        if ckpt_proj_type != args.projection:
+            raise ValueError(
+                f"Checkpoint uses projection '{ckpt_proj_type}' but --projection={args.projection}. "
+                f"Use --projection {ckpt_proj_type} to match the checkpoint.")
         vocoder.projection.load_state_dict(ckpt['projection'])
         vocoder.bigvgan.load_state_dict(ckpt['bigvgan'])
         mpd.load_state_dict(ckpt['mpd'])
@@ -670,7 +680,7 @@ def train(args):
             # ── Checkpoint (main process only) ──────────────────────────────
             if is_main_process(rank) and steps % args.save_interval == 0 and steps > 0:
                 ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}.pt'
-                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase)
+                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase, args.projection)
                 log(f"[Train] Saved checkpoint: {ckpt_path}")
                 prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
@@ -687,7 +697,7 @@ def train(args):
                 if is_main_process(rank):
                     log(f"[Train] Reached {args.steps:,d} steps. Done.")
                     ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}_final.pt'
-                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase)
+                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase, args.projection)
                 cleanup_distributed()
                 return
 
@@ -713,6 +723,11 @@ def main():
     parser.add_argument('--feat_dir', required=True, help='Root directory of .pt WavLM feature files')
     parser.add_argument('--checkpoint_dir', default='./checkpoints/bigvgan')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--projection', default='linear',
+                        choices=['linear', 'mlp', 'conv', 'conv_bn', 'deconv'],
+                        help='Projection layer type: linear (baseline), mlp (2-layer), '
+                             'conv (temporal conv1d), conv_bn (conv + batchnorm), '
+                             'deconv (learned upsampling via transposed conv)')
     parser.add_argument('--phase', choices=['A', 'B'], default='A',
                         help='A=projection only, B=end-to-end fine-tune')
     parser.add_argument('--steps', type=int, default=50000)
