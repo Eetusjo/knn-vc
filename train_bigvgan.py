@@ -457,7 +457,7 @@ def train(args):
 
     # ── Wrap models with DDP ─────────────────────────────────────────────────
     if world_size > 1:
-        vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=True)
+        vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=False)
         mpd = DDP(mpd, device_ids=[local_rank])
         mrd = DDP(mrd, device_ids=[local_rank])
 
