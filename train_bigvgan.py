@@ -97,6 +97,9 @@ def setup_distributed():
         return 0, 0, 1
 
 
+
+
+
 def cleanup_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
@@ -335,9 +338,9 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samples=4):
-    """Run validation: compute mel loss over the val set, log to TensorBoard."""
-    # Use the unwrapped module to avoid DDP collective ops (only rank 0 runs validation)
+def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
+             rank, world_size, num_audio_samples=4):
+    """Run validation across all ranks, then all-reduce the loss."""
     model = vocoder.module if hasattr(vocoder, 'module') else vocoder
     model.eval()
 
@@ -349,8 +352,7 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samp
         feats = feats.to(device)
         wav_real = wav_real.to(device).unsqueeze(1)
 
-        with torch.no_grad():
-            wav_gen = model(feats)
+        wav_gen = model(feats)
 
         min_len = min(wav_real.shape[-1], wav_gen.shape[-1])
         wav_real = wav_real[..., :min_len]
@@ -364,6 +366,12 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps, num_audio_samp
                 sw.add_audio(f'val/gen_{audio_logged}', wav_gen[j], steps, sample_rate=24000)
                 sw.add_audio(f'val/real_{audio_logged}', wav_real[j], steps, sample_rate=24000)
                 audio_logged += 1
+
+    if world_size > 1:
+        stats = torch.tensor([total_mel, n_batches], dtype=torch.float64, device=device)
+        dist.all_reduce(stats)
+        total_mel = stats[0].item()
+        n_batches = int(stats[1].item())
 
     val_mel = total_mel / max(n_batches, 1)
 
@@ -539,9 +547,11 @@ def train(args):
             target_sr=h.sampling_rate,
             verbose=is_main_process(rank),
         )
+        val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False) if world_size > 1 else None
         val_loader = DataLoader(
             val_dataset,
             batch_size=args.batch_size,
+            sampler=val_sampler,
             shuffle=False,
             num_workers=args.num_workers,
             drop_last=False,
@@ -698,18 +708,14 @@ def train(args):
                 log(f"[Train] Saved checkpoint: {ckpt_path}")
                 prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
-            # ── Validation ──────────────────────────────────────────────────
-            # Rank 0 runs inference on the unwrapped module; all ranks must
-            # wait so they don't advance into a DDP forward pass that rank 0
-            # can't join.
+            # ── Validation (all ranks) ─────────────────────────────────────
             if (val_loader is not None
                     and steps % args.val_interval == 0
                     and steps > 0):
+                val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
+                                   rank, world_size)
                 if is_main_process(rank):
-                    val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps)
                     log(f"[Val] Step {steps:,d} | val_mel={val_mel:.3f}")
-                if use_ddp:
-                    dist.barrier()
 
             steps += 1
             if steps >= args.steps:
