@@ -698,13 +698,18 @@ def train(args):
                 log(f"[Train] Saved checkpoint: {ckpt_path}")
                 prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
-            # ── Validation (main process only) ─────────────────────────────
+            # ── Validation ──────────────────────────────────────────────────
+            # Rank 0 runs inference on the unwrapped module; all ranks must
+            # wait so they don't advance into a DDP forward pass that rank 0
+            # can't join.
             if (val_loader is not None
-                    and is_main_process(rank)
                     and steps % args.val_interval == 0
                     and steps > 0):
-                val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps)
-                log(f"[Val] Step {steps:,d} | val_mel={val_mel:.3f}")
+                if is_main_process(rank):
+                    val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps)
+                    log(f"[Val] Step {steps:,d} | val_mel={val_mel:.3f}")
+                if use_ddp:
+                    dist.barrier()
 
             steps += 1
             if steps >= args.steps:
