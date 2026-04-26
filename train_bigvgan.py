@@ -437,14 +437,19 @@ def train(args):
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = False
         g_params = list(vocoder.projection.parameters())
-        lr_g = 2e-4
+        default_lr = 2e-4
     else:
         if is_main_process(rank):
             log("[Train] Phase B: end-to-end fine-tuning.")
         for p in vocoder.bigvgan.parameters():
             p.requires_grad = True
         g_params = list(vocoder.parameters())
-        lr_g = 1e-4  # Lower LR for end-to-end fine-tuning
+        default_lr = 1e-4
+
+    lr_g = args.lr_g if args.lr_g is not None else default_lr
+    lr_d = args.lr_d if args.lr_d is not None else lr_g
+    if is_main_process(rank):
+        log(f"[Train] LR: generator={lr_g:.1e}, discriminator={lr_d:.1e}")
 
     # ── Wrap models with DDP ─────────────────────────────────────────────────
     if world_size > 1:
@@ -456,7 +461,7 @@ def train(args):
     optim_g = torch.optim.AdamW(g_params, lr=lr_g, betas=(0.8, 0.99))
     optim_d = torch.optim.AdamW(
         itertools.chain(mpd.parameters(), mrd.parameters()),
-        lr=lr_g, betas=(0.8, 0.99)
+        lr=lr_d, betas=(0.8, 0.99)
     )
 
     if args.resume:
@@ -730,6 +735,10 @@ def main():
                              'deconv (learned upsampling via transposed conv)')
     parser.add_argument('--phase', choices=['A', 'B'], default='A',
                         help='A=projection only, B=end-to-end fine-tune')
+    parser.add_argument('--lr_g', type=float, default=None,
+                        help='Generator learning rate. Default: 2e-4 for Phase A, 1e-4 for Phase B.')
+    parser.add_argument('--lr_d', type=float, default=None,
+                        help='Discriminator learning rate. Default: same as generator LR.')
     parser.add_argument('--steps', type=int, default=50000)
     parser.add_argument('--batch_size', type=int, default=16)
     parser.add_argument('--segment_seconds', type=int, default=1,
