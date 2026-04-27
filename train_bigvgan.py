@@ -199,14 +199,15 @@ class WavLMVocoderDataset(Dataset):
     def __getitem__(self, idx):
         audio_path, feat_path = self.pairs[idx]
 
-        # Load audio
-        wav, sr = torchaudio.load(audio_path, normalize=True)
-        if sr != self.target_sr:
-            wav = torchaudio.functional.resample(wav, sr, self.target_sr)
-        wav = wav.mean(dim=0)  # mono, shape (T,)
-
-        # Load WavLM features
-        feats = torch.load(feat_path, map_location='cpu').float()  # (seq_len, 1024)
+        try:
+            wav, sr = torchaudio.load(audio_path, normalize=True)
+            if sr != self.target_sr:
+                wav = torchaudio.functional.resample(wav, sr, self.target_sr)
+            wav = wav.mean(dim=0)  # mono, shape (T,)
+            feats = torch.load(feat_path, map_location='cpu').float()  # (seq_len, 1024)
+        except (RuntimeError, Exception) as e:
+            log(f"[Dataset] Skipping corrupt file {feat_path}: {e}")
+            return self.__getitem__(random.randint(0, len(self.pairs) - 1))
 
         if self.split:
             # Pad short utterances so every sample is exactly (frames_per_seg, 1024) / (segment_size,)
