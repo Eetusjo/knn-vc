@@ -350,8 +350,9 @@ class KNeighborsVC(nn.Module):
         # store wavlm
         self.wavlm = wavlm.eval()
         self.device = torch.device(device)
-        self.sr = self.h.sampling_rate
-        self.hop_length = 320
+        self.wavlm_sr = 16000           # WavLM input is fixed at 16 kHz.
+        self.out_sr = self.h.sampling_rate
+        self.hop_length = 320           # WavLM hop at 16 kHz.
 
     def get_matching_set(self, wavs: list[Path] | list[Tensor], weights=None, vad_trigger_level=7) -> Tensor:
         """ Get concatenated wavlm features for the matching set using all waveforms in `wavs`, 
@@ -386,13 +387,13 @@ class KNeighborsVC(nn.Module):
             x, sr = torchaudio.load(path, normalize=True)
         else:
             x: Tensor = path
-            sr = self.sr
+            sr = self.wavlm_sr
             if x.dim() == 1: x = x[None]
-                
-        if not sr == self.sr :
-            print(f"resample {sr} to {self.sr} in {path}")
-            x = torchaudio.functional.resample(x, orig_freq=sr, new_freq=self.sr)
-            sr = self.sr
+
+        if not sr == self.wavlm_sr :
+            print(f"resample {sr} to {self.wavlm_sr} in {path}")
+            x = torchaudio.functional.resample(x, orig_freq=sr, new_freq=self.wavlm_sr)
+            sr = self.wavlm_sr
             
         # trim silence from front and back
         if vad_trigger_level > 1e-3:
@@ -449,7 +450,7 @@ class KNeighborsVC(nn.Module):
         query_seq = query_seq.to(device)
 
         if target_duration is not None:
-            target_samples = int(target_duration*self.sr)
+            target_samples = int(target_duration*self.wavlm_sr)
             scale_factor = (target_samples/self.hop_length) / query_seq.shape[0] # n_targ_feats / n_input_feats
             query_seq = F.interpolate(query_seq.T[None], scale_factor=scale_factor, mode='linear')[0].T
 
@@ -461,7 +462,7 @@ class KNeighborsVC(nn.Module):
 
         # normalization
         if tgt_loudness_db is not None:
-            src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
+            src_loudness = torchaudio.functional.loudness(prediction[None], self.out_sr)
             tgt_loudness = tgt_loudness_db
             pred_wav = torchaudio.functional.gain(prediction, tgt_loudness - src_loudness)
         else: pred_wav = prediction
@@ -534,7 +535,7 @@ class KNeighborsVC(nn.Module):
 
         # Handle target duration by interpolating query sequence
         if target_duration is not None:
-            target_samples = int(target_duration * self.sr)
+            target_samples = int(target_duration * self.wavlm_sr)
             scale_factor = (target_samples / self.hop_length) / query_seq.shape[0]
             query_seq = F.interpolate(query_seq.T[None], scale_factor=scale_factor, mode='linear')[0].T
 
@@ -548,8 +549,8 @@ class KNeighborsVC(nn.Module):
             if query_wav_path is not None:
                 # Load waveform for more accurate VAD
                 wav, sr = torchaudio.load(query_wav_path, normalize=True)
-                if sr != self.sr:
-                    wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.sr)
+                if sr != self.wavlm_sr:
+                    wav = torchaudio.functional.resample(wav, orig_freq=sr, new_freq=self.wavlm_sr)
                 waveform = wav.squeeze()  # (n_samples,)
 
             is_speech = detect_voice_activity_energy(
@@ -597,7 +598,7 @@ class KNeighborsVC(nn.Module):
 
         # Normalize output loudness
         if tgt_loudness_db is not None:
-            src_loudness = torchaudio.functional.loudness(prediction[None], self.h.sampling_rate)
+            src_loudness = torchaudio.functional.loudness(prediction[None], self.out_sr)
             pred_wav = torchaudio.functional.gain(prediction, tgt_loudness_db - src_loudness)
         else:
             pred_wav = prediction

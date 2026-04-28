@@ -294,21 +294,27 @@ def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, pha
     def unwrap(m):
         return m.module if isinstance(m, DDP) else m
 
-    # Atomic write: save to .tmp then rename, so an interrupted save doesn't leave
-    # a half-written checkpoint on disk.
-    tmp_path = str(path) + '.tmp'
-    torch.save({
+    state = {
         'projection': unwrap(vocoder).projection.state_dict(),
         'projection_type': projection_type,
         'bigvgan': unwrap(vocoder).bigvgan.state_dict(),
-        'mpd': unwrap(mpd).state_dict(),
-        'mrd': unwrap(mrd).state_dict(),
         'optim_g': optim_g.state_dict(),
-        'optim_d': optim_d.state_dict(),
         'steps': steps,
         'epoch': epoch,
         'phase': phase,
-    }, tmp_path)
+    }
+    # Phase A skips discriminators entirely; their state is only present in Phase B.
+    if mpd is not None:
+        state['mpd'] = unwrap(mpd).state_dict()
+    if mrd is not None:
+        state['mrd'] = unwrap(mrd).state_dict()
+    if optim_d is not None:
+        state['optim_d'] = optim_d.state_dict()
+
+    # Atomic write: save to .tmp then rename, so an interrupted save doesn't leave
+    # a half-written checkpoint on disk.
+    tmp_path = str(path) + '.tmp'
+    torch.save(state, tmp_path)
     os.replace(tmp_path, path)
 
 
@@ -415,14 +421,21 @@ def train(args):
         n_proj = sum(p.numel() for p in projection.parameters())
         log(f"[Train] Projection: {args.projection} ({n_proj:,d} params)")
 
-    # ── Discriminators (match BigVGAN-v2 config) ─────────────────────────────
-    mpd = MultiPeriodDiscriminator(h).to(device)
-    if h.get('use_mbd_instead_of_mrd', False):
-        mrd = MultiBandDiscriminator(h).to(device)
-    elif h.get('use_cqtd_instead_of_mrd', False):
-        mrd = MultiScaleSubbandCQTDiscriminator(h).to(device)
-    else:
-        mrd = MultiResolutionDiscriminator(h).to(device)
+    # Phase A trains the projection on mel-loss only; the discriminators would be
+    # random-init noise that fights the projection. Only build them in Phase B.
+    use_disc = (args.phase == 'B')
+
+    # ── Discriminators (Phase B only; match BigVGAN-v2 config) ───────────────
+    mpd = None
+    mrd = None
+    if use_disc:
+        mpd = MultiPeriodDiscriminator(h).to(device)
+        if h.get('use_mbd_instead_of_mrd', False):
+            mrd = MultiBandDiscriminator(h).to(device)
+        elif h.get('use_cqtd_instead_of_mrd', False):
+            mrd = MultiScaleSubbandCQTDiscriminator(h).to(device)
+        else:
+            mrd = MultiResolutionDiscriminator(h).to(device)
 
     # ── Resume from checkpoint ───────────────────────────────────────────────
     steps = 0
@@ -438,8 +451,12 @@ def train(args):
                 f"Use --projection {ckpt_proj_type} to match the checkpoint.")
         vocoder.projection.load_state_dict(ckpt['projection'])
         vocoder.bigvgan.load_state_dict(ckpt['bigvgan'])
-        mpd.load_state_dict(ckpt['mpd'])
-        mrd.load_state_dict(ckpt['mrd'])
+        # Phase-A checkpoints don't store discriminator state; let them init fresh
+        # for the Phase A→B transition.
+        if mpd is not None and 'mpd' in ckpt:
+            mpd.load_state_dict(ckpt['mpd'])
+        if mrd is not None and 'mrd' in ckpt:
+            mrd.load_state_dict(ckpt['mrd'])
         steps = ckpt.get('steps', 0)
         start_epoch = ckpt.get('epoch', 0)
         resumed_phase = ckpt.get('phase', None)
@@ -470,15 +487,18 @@ def train(args):
     # ── Wrap models with DDP ─────────────────────────────────────────────────
     if world_size > 1:
         vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=False)
-        mpd = DDP(mpd, device_ids=[local_rank])
-        mrd = DDP(mrd, device_ids=[local_rank])
+        if use_disc:
+            mpd = DDP(mpd, device_ids=[local_rank])
+            mrd = DDP(mrd, device_ids=[local_rank])
 
     # ── Optimizers ───────────────────────────────────────────────────────────
     optim_g = torch.optim.AdamW(g_params, lr=lr_g, betas=(0.8, 0.99))
-    optim_d = torch.optim.AdamW(
-        itertools.chain(mpd.parameters(), mrd.parameters()),
-        lr=lr_d, betas=(0.8, 0.99)
-    )
+    optim_d = None
+    if use_disc:
+        optim_d = torch.optim.AdamW(
+            itertools.chain(mpd.parameters(), mrd.parameters()),
+            lr=lr_d, betas=(0.8, 0.99)
+        )
 
     if args.resume:
         # Only restore optimizer state when continuing the SAME phase. A Phase A→B
@@ -487,14 +507,17 @@ def train(args):
         same_phase = (resumed_phase == args.phase)
         if same_phase:
             optim_g.load_state_dict(ckpt['optim_g'])
-            optim_d.load_state_dict(ckpt['optim_d'])
+            if optim_d is not None and 'optim_d' in ckpt:
+                optim_d.load_state_dict(ckpt['optim_d'])
         else:
             if is_main_process(rank):
                 log(f"[Train] Phase change (ckpt={resumed_phase} → run={args.phase}): "
                     f"re-initializing optimizer states with fresh LR={lr_g:.1e}.")
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
-    scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
+    scheduler_d = None
+    if use_disc:
+        scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
 
     # ── Loss functions ────────────────────────────────────────────────────────
     mel_loss_fn = MultiScaleMelSpectrogramLoss(sampling_rate=h.sampling_rate).to(device)
@@ -575,8 +598,9 @@ def train(args):
             f"{args.accumulation_steps} accum = {eff_bs}")
 
     vocoder.train()
-    mpd.train()
-    mrd.train()
+    if use_disc:
+        mpd.train()
+        mrd.train()
 
     accum_steps = args.accumulation_steps
     use_ddp = world_size > 1
@@ -587,7 +611,8 @@ def train(args):
             return model.no_sync()
         return contextlib.nullcontext()
 
-    optim_d.zero_grad()
+    if use_disc:
+        optim_d.zero_grad()
     optim_g.zero_grad()
 
     for epoch in range(start_epoch, 10000):
@@ -624,45 +649,56 @@ def train(args):
             wav_real = wav_real[..., :min_len]
             wav_gen = wav_gen[..., :min_len]
 
-            # ── Discriminator update ────────────────────────────────────────
-            with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
-                y_df_r, y_df_g, _, _ = mpd(wav_real, wav_gen.detach())
-                loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
+            if use_disc:
+                # ── Discriminator update ────────────────────────────────────
+                with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
+                    y_df_r, y_df_g, _, _ = mpd(wav_real, wav_gen.detach())
+                    loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
 
-                y_dr_r, y_dr_g, _, _ = mrd(wav_real, wav_gen.detach())
-                loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
+                    y_dr_r, y_dr_g, _, _ = mrd(wav_real, wav_gen.detach())
+                    loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
 
-                loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
-                loss_d.backward()
+                    loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
+                    loss_d.backward()
 
-            # ── Generator update ────────────────────────────────────────────
-            with maybe_no_sync(vocoder, is_last_micro), \
-                 maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
-                loss_mel = mel_loss_fn(wav_gen, wav_real)
+                # ── Generator update (mel + feature-match + adversarial) ────
+                with maybe_no_sync(vocoder, is_last_micro), \
+                     maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
+                    loss_mel = mel_loss_fn(wav_gen, wav_real)
 
-                y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wav_real, wav_gen)
-                y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wav_real, wav_gen)
+                    y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wav_real, wav_gen)
+                    y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wav_real, wav_gen)
 
-                loss_fm_mpd = feature_loss(fmap_f_r, fmap_f_g)
-                loss_fm_mrd = feature_loss(fmap_r_r, fmap_r_g)
-                loss_gen_mpd, _ = generator_loss(y_df_g)
-                loss_gen_mrd, _ = generator_loss(y_dr_g)
+                    loss_fm_mpd = feature_loss(fmap_f_r, fmap_f_g)
+                    loss_fm_mrd = feature_loss(fmap_r_r, fmap_r_g)
+                    loss_gen_mpd, _ = generator_loss(y_df_g)
+                    loss_gen_mrd, _ = generator_loss(y_dr_g)
 
-                loss_g = (loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
-                loss_g.backward()
+                    loss_g = (loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
+                    loss_g.backward()
 
-            # Track unscaled losses for logging
-            accum_loss_d += loss_d.item() * accum_steps
+                accum_loss_d += loss_d.item() * accum_steps
+                accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
+            else:
+                # ── Phase A: mel-loss only ──────────────────────────────────
+                # Random-init discriminators would just be noise at this stage,
+                # so we drop the adversarial path entirely and let the multi-scale
+                # mel loss supervise the projection.
+                with maybe_no_sync(vocoder, is_last_micro):
+                    loss_mel = mel_loss_fn(wav_gen, wav_real)
+                    loss_g = loss_mel / accum_steps
+                    loss_g.backward()
+
             accum_loss_g += loss_g.item() * accum_steps
             accum_loss_mel += loss_mel.item()
-            accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
 
             # Stop training immediately if we hit a non-finite loss — for long
             # runs this saves hours of wasted compute chasing NaNs.
-            if not (torch.isfinite(loss_g) and torch.isfinite(loss_d)):
+            if not torch.isfinite(loss_g) or (use_disc and not torch.isfinite(loss_d)):
                 if is_main_process(rank):
+                    d_str = f", D={loss_d.item()}" if use_disc else ""
                     log(f"[Train] ABORT: non-finite loss at step {steps} "
-                        f"(G={loss_g.item()}, D={loss_d.item()})")
+                        f"(G={loss_g.item()}{d_str})")
                 cleanup_distributed()
                 return
 
@@ -671,31 +707,36 @@ def train(args):
 
             # ── Optimizer step (every accum_steps micro-batches) ───────────
             if args.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    itertools.chain(mpd.parameters(), mrd.parameters()),
-                    args.grad_clip,
-                )
+                if use_disc:
+                    torch.nn.utils.clip_grad_norm_(
+                        itertools.chain(mpd.parameters(), mrd.parameters()),
+                        args.grad_clip,
+                    )
                 torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
-            optim_d.step()
+            if use_disc:
+                optim_d.step()
+                optim_d.zero_grad()
             optim_g.step()
-            optim_d.zero_grad()
             optim_g.zero_grad()
 
             # ── Logging (main process only) ─────────────────────────────────
             if is_main_process(rank) and steps % args.log_interval == 0:
                 avg_mel = accum_loss_mel / accum_steps
-                avg_fm = accum_loss_fm / accum_steps
                 avg_g = accum_loss_g / accum_steps
-                avg_d = accum_loss_d / accum_steps
-                log(
-                    f"Step {steps:,d} | "
-                    f"G={avg_g:.3f} mel={avg_mel:.3f} "
-                    f"fm={avg_fm:.3f} "
-                    f"D={avg_d:.3f}"
-                )
+                if use_disc:
+                    avg_fm = accum_loss_fm / accum_steps
+                    avg_d = accum_loss_d / accum_steps
+                    log(
+                        f"Step {steps:,d} | "
+                        f"G={avg_g:.3f} mel={avg_mel:.3f} "
+                        f"fm={avg_fm:.3f} "
+                        f"D={avg_d:.3f}"
+                    )
+                    sw.add_scalar('train/loss_d', avg_d, steps)
+                else:
+                    log(f"Step {steps:,d} | G={avg_g:.3f} mel={avg_mel:.3f}")
                 sw.add_scalar('train/loss_g', avg_g, steps)
                 sw.add_scalar('train/loss_mel', avg_mel, steps)
-                sw.add_scalar('train/loss_d', avg_d, steps)
 
             accum_loss_g = 0.0
             accum_loss_d = 0.0
@@ -730,11 +771,13 @@ def train(args):
         # Discard leftover micro-batches that didn't complete a full
         # accumulation window — partial averages would skew the update.
         if micro % accum_steps != 0:
-            optim_d.zero_grad()
+            if use_disc:
+                optim_d.zero_grad()
             optim_g.zero_grad()
 
         scheduler_g.step()
-        scheduler_d.step()
+        if use_disc:
+            scheduler_d.step()
 
     cleanup_distributed()
 
@@ -749,11 +792,11 @@ def main():
     parser.add_argument('--feat_dir', required=True, help='Root directory of .pt WavLM feature files')
     parser.add_argument('--checkpoint_dir', default='./checkpoints/bigvgan')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
-    parser.add_argument('--projection', default='linear',
+    parser.add_argument('--projection', default='deconv',
                         choices=['linear', 'mlp', 'conv', 'conv_bn', 'deconv'],
                         help='Projection layer type: linear (baseline), mlp (2-layer), '
                              'conv (temporal conv1d), conv_bn (conv + batchnorm), '
-                             'deconv (learned upsampling via transposed conv)')
+                             'deconv (learned upsampling via transposed conv, default)')
     parser.add_argument('--phase', choices=['A', 'B'], default='A',
                         help='A=projection only, B=end-to-end fine-tune')
     parser.add_argument('--lr_g', type=float, default=None,

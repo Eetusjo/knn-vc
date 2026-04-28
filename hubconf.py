@@ -107,20 +107,20 @@ def bigvgan_wavlm(pretrained=True, device='cuda', checkpoint_path=None):
             model.load_state_dict(ckpt['bigvgan'])
         print(f"[BigVGAN] Loaded fine-tuned checkpoint from {checkpoint_path} (projection: {proj_type})")
     else:
-        projection = build_projection('linear', in_dim=1024, out_dim=model.h.num_mels)
-        print("[BigVGAN] Using pretrained BigVGAN with randomly initialized projection layer.")
+        projection = build_projection('deconv', in_dim=1024, out_dim=model.h.num_mels)
+        print("[BigVGAN] Using pretrained BigVGAN with a randomly initialized 'deconv' projection.")
         print("[BigVGAN] Note: fine-tune with train_bigvgan.py for good quality.")
 
-    vocoder = BigVGANVocoder(model, projection, target_sr=16000).to(device)
+    vocoder = BigVGANVocoder(model, projection, target_sr=model.h.sampling_rate).to(device)
     vocoder.eval()
     vocoder.remove_weight_norm()
     print(f"[BigVGAN] Loaded with {sum(p.numel() for p in vocoder.parameters()):,d} parameters "
           f"({sum(p.numel() for p in vocoder.projection.parameters()):,d} in projection layer).")
 
-    # Build a config AttrDict compatible with KNeighborsVC expectations
-    # KNeighborsVC only uses cfg.sampling_rate for loudness normalization
+    # Build a config AttrDict compatible with KNeighborsVC expectations.
+    # Output stays at BigVGAN's native rate (24 kHz) — no downsampling to 16 kHz.
     cfg = AttrDict({
-        'sampling_rate': 16000,  # target output sample rate (resampled from 24kHz)
+        'sampling_rate': model.h.sampling_rate,
         'num_mels': model.h.num_mels,
         'hop_size': model.h.hop_size,
     })
