@@ -114,11 +114,50 @@ def log(msg):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Bandwidth-aware mel loss helper
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _bandlimit_to(wav: torch.Tensor, src_sr: int, native_sr: int) -> torch.Tensor:
+    """Round-trip resample wav (..., T) through native_sr to remove content above
+    native_sr/2. No-op when native_sr >= src_sr."""
+    if native_sr >= src_sr:
+        return wav
+    T = wav.shape[-1]
+    x = torchaudio.functional.resample(wav, src_sr, native_sr)
+    x = torchaudio.functional.resample(x, native_sr, src_sr)
+    if x.shape[-1] > T:
+        x = x[..., :T]
+    elif x.shape[-1] < T:
+        x = F.pad(x, (0, T - x.shape[-1]))
+    return x
+
+
+def _bandlimit_batch(wav_real: torch.Tensor, wav_gen: torch.Tensor,
+                     native_srs: torch.Tensor, src_sr: int):
+    """For samples whose native SR is below src_sr, low-pass both the real and
+    generated waveforms to that SR. Returns the (possibly modified) tensors;
+    if every sample is wideband the inputs are returned unchanged."""
+    if bool((native_srs >= src_sr).all().item()):
+        return wav_real, wav_gen
+    real_chunks = []
+    gen_chunks = []
+    for i in range(wav_real.shape[0]):
+        ns = int(native_srs[i].item())
+        if ns >= src_sr:
+            real_chunks.append(wav_real[i:i + 1])
+            gen_chunks.append(wav_gen[i:i + 1])
+        else:
+            real_chunks.append(_bandlimit_to(wav_real[i:i + 1], src_sr, ns))
+            gen_chunks.append(_bandlimit_to(wav_gen[i:i + 1], src_sr, ns))
+    return torch.cat(real_chunks, dim=0), torch.cat(gen_chunks, dim=0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Dataset
 # ──────────────────────────────────────────────────────────────────────────────
 
 class WavLMVocoderDataset(Dataset):
-    """Paired (WavLM features, audio waveform) dataset for BigVGAN fine-tuning.
+    """Paired (WavLM features, audio waveform, native_sr) dataset for BigVGAN fine-tuning.
 
     Expects one or more (audio_dir, feat_dir) pairs. Each feat_dir contains .pt files
     (WavLM layer-6 features, shape (seq_len, 1024)) with the same relative paths as
@@ -126,8 +165,10 @@ class WavLMVocoderDataset(Dataset):
 
     Segment size is in samples at target_sr. Features are trimmed/padded to match.
 
-    When supplementary directories are provided, `group_indices` tracks which samples
+    When supplementary directories are provided, `group_of` tracks which samples
     belong to the primary (0) vs supplementary (1) group for weighted sampling.
+    `native_sr_of` records the source SR per sample so the training loop can
+    band-limit narrowband clips before computing the mel loss.
     """
 
     AUDIO_EXTS = ('.wav', '.flac', '.mp3', '.ogg', '.opus')
@@ -136,12 +177,13 @@ class WavLMVocoderDataset(Dataset):
         self,
         audio_dir: Path,
         feat_dir: Path,
-        supplementary_dirs: list[tuple[Path, Path]] | None = None,
+        supplementary_dirs: list[tuple[Path, Path, int]] | list[tuple[Path, Path]] | None = None,
         segment_size: int = 24000 * 1,  # 1 second at 24kHz
         target_sr: int = 24000,
         wavlm_frame_rate: int = 50,  # 50 frames/sec = 20ms hop
         split: bool = True,
         verbose: bool = True,
+        primary_native_sr: int = 24000,
     ):
         self.segment_size = segment_size
         self.target_sr = target_sr
@@ -151,11 +193,19 @@ class WavLMVocoderDataset(Dataset):
         self._verbose = verbose
 
         self.pairs = []
-        self.group_of = []  # 0 = primary, 1 = supplementary
+        self.group_of = []        # 0 = primary, 1 = supplementary
+        self.native_sr_of = []    # source SR per sample (for bandwidth-aware loss)
 
-        self._scan_dirs(Path(audio_dir), Path(feat_dir), group=0)
-        for sup_audio, sup_feat in (supplementary_dirs or []):
-            self._scan_dirs(Path(sup_audio), Path(sup_feat), group=1)
+        self._scan_dirs(Path(audio_dir), Path(feat_dir), group=0,
+                        native_sr=int(primary_native_sr))
+        for sup in (supplementary_dirs or []):
+            if len(sup) == 3:
+                sup_audio, sup_feat, sup_sr = sup
+            else:
+                sup_audio, sup_feat = sup
+                sup_sr = target_sr
+            self._scan_dirs(Path(sup_audio), Path(sup_feat), group=1,
+                            native_sr=int(sup_sr))
 
         if len(self.pairs) == 0:
             raise ValueError(
@@ -169,8 +219,13 @@ class WavLMVocoderDataset(Dataset):
         n_supp = self.group_of.count(1)
         if self._verbose:
             log(f"[Dataset] {n_primary:,d} primary + {n_supp:,d} supplementary = {len(self.pairs):,d} total pairs.")
+            sr_counts = {}
+            for sr in self.native_sr_of:
+                sr_counts[sr] = sr_counts.get(sr, 0) + 1
+            sr_summary = ', '.join(f"{sr} Hz: {n:,d}" for sr, n in sorted(sr_counts.items()))
+            log(f"[Dataset] Native-SR breakdown — {sr_summary}")
 
-    def _scan_dirs(self, audio_dir: Path, feat_dir: Path, group: int):
+    def _scan_dirs(self, audio_dir: Path, feat_dir: Path, group: int, native_sr: int):
         missing_audio = 0
         found = 0
         for feat_path in sorted(feat_dir.rglob('*.pt')):
@@ -184,6 +239,7 @@ class WavLMVocoderDataset(Dataset):
             if audio_path is not None:
                 self.pairs.append((audio_path, feat_path))
                 self.group_of.append(group)
+                self.native_sr_of.append(native_sr)
                 found += 1
             else:
                 missing_audio += 1
@@ -191,13 +247,14 @@ class WavLMVocoderDataset(Dataset):
             if missing_audio:
                 log(f"[Dataset] WARNING: {missing_audio:,d} .pt files have no matching audio in {audio_dir}.")
             label = "primary" if group == 0 else "supplementary"
-            log(f"[Dataset] Found {found:,d} paired files in {feat_dir} ({label}).")
+            log(f"[Dataset] Found {found:,d} paired files in {feat_dir} ({label}, native_sr={native_sr}).")
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, idx):
         audio_path, feat_path = self.pairs[idx]
+        native_sr = self.native_sr_of[idx]
 
         try:
             wav, sr = torchaudio.load(audio_path, normalize=True)
@@ -239,7 +296,7 @@ class WavLMVocoderDataset(Dataset):
             if wav.shape[0] < self.segment_size:
                 wav = F.pad(wav, (0, self.segment_size - wav.shape[0]))
 
-        return feats, wav  # (frames_per_seg, 1024), (segment_size,)
+        return feats, wav, native_sr  # (frames_per_seg, 1024), (segment_size,), int
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -346,7 +403,7 @@ def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
 
 @torch.no_grad()
 def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
-             rank, world_size, num_audio_samples=4):
+             rank, world_size, src_sr, num_audio_samples=4):
     """Run validation across all ranks, then all-reduce the loss."""
     model = vocoder.module if hasattr(vocoder, 'module') else vocoder
     model.eval()
@@ -355,9 +412,10 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
     n_batches = 0
     audio_logged = 0
 
-    for feats, wav_real in val_loader:
+    for feats, wav_real, native_srs in val_loader:
         feats = feats.to(device)
         wav_real = wav_real.to(device).unsqueeze(1)
+        native_srs = native_srs.to(device)
 
         wav_gen = model(feats)
 
@@ -365,7 +423,11 @@ def validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
         wav_real = wav_real[..., :min_len]
         wav_gen = wav_gen[..., :min_len]
 
-        total_mel += mel_loss_fn(wav_gen, wav_real).item()
+        # Apply per-sample band-limit so val mel loss matches the training-time loss
+        # for any narrowband validation samples (typically a no-op).
+        wav_real_for_mel, wav_gen_for_mel = _bandlimit_batch(
+            wav_real, wav_gen, native_srs, src_sr=src_sr)
+        total_mel += mel_loss_fn(wav_gen_for_mel, wav_real_for_mel).item()
         n_batches += 1
 
         if sw is not None and audio_logged < num_audio_samples:
@@ -528,9 +590,19 @@ def train(args):
     supplementary_dirs = None
     if args.supplementary_dirs:
         supplementary_dirs = []
-        for pair in args.supplementary_dirs:
-            a_dir, f_dir = pair.split(':')
-            supplementary_dirs.append((Path(a_dir), Path(f_dir)))
+        for spec in args.supplementary_dirs:
+            parts = spec.split(':')
+            if len(parts) == 2:
+                a_dir, f_dir = parts
+                native_sr = h.sampling_rate
+            elif len(parts) == 3:
+                a_dir, f_dir, native_sr_str = parts
+                native_sr = int(native_sr_str)
+            else:
+                raise ValueError(
+                    f"Invalid --supplementary_dirs entry '{spec}'. "
+                    f"Expected AUDIO:FEAT or AUDIO:FEAT:NATIVE_SR.")
+            supplementary_dirs.append((Path(a_dir), Path(f_dir), native_sr))
 
     dataset = WavLMVocoderDataset(
         audio_dir=args.audio_dir,
@@ -635,9 +707,10 @@ def train(args):
         accum_loss_mel = 0.0
         accum_loss_fm = 0.0
 
-        for feats, wav_real in loader:
+        for feats, wav_real, native_srs in loader:
             feats = feats.to(device)       # (B, frames, 1024)
             wav_real = wav_real.to(device).unsqueeze(1)  # (B, 1, T)
+            native_srs = native_srs.to(device)            # (B,) int64
             micro += 1
             is_last_micro = (micro % accum_steps == 0)
 
@@ -649,25 +722,51 @@ def train(args):
             wav_real = wav_real[..., :min_len]
             wav_gen = wav_gen[..., :min_len]
 
-            if use_disc:
-                # ── Discriminator update ────────────────────────────────────
+            # Bandwidth-aware mel target: low-pass narrowband samples so we don't
+            # penalize the generator for producing energy above the source's Nyquist.
+            wav_real_for_mel, wav_gen_for_mel = _bandlimit_batch(
+                wav_real, wav_gen, native_srs, src_sr=h.sampling_rate)
+
+            # Wideband subset is the only one that participates in the GAN path —
+            # otherwise D would learn "wideband ⇒ fake" for the band-limited clips.
+            wb_mask = native_srs >= h.sampling_rate
+            has_wb = bool(wb_mask.any().item())
+            wb_idx = torch.where(wb_mask)[0] if has_wb else None
+
+            loss_d = None
+            loss_fm_mpd = None
+            loss_fm_mrd = None
+
+            if use_disc and has_wb:
+                wb_real = wav_real[wb_idx]
+                wb_gen = wav_gen[wb_idx]
+
+                # ── Discriminator update (wideband samples only) ────────────
                 with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
-                    y_df_r, y_df_g, _, _ = mpd(wav_real, wav_gen.detach())
+                    y_df_r, y_df_g, _, _ = mpd(wb_real, wb_gen.detach())
                     loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
 
-                    y_dr_r, y_dr_g, _, _ = mrd(wav_real, wav_gen.detach())
+                    y_dr_r, y_dr_g, _, _ = mrd(wb_real, wb_gen.detach())
                     loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
 
                     loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
                     loss_d.backward()
 
-                # ── Generator update (mel + feature-match + adversarial) ────
-                with maybe_no_sync(vocoder, is_last_micro), \
-                     maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
-                    loss_mel = mel_loss_fn(wav_gen, wav_real)
+            # ── Generator update ────────────────────────────────────────────
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(maybe_no_sync(vocoder, is_last_micro))
+                if use_disc and has_wb:
+                    stack.enter_context(maybe_no_sync(mpd, is_last_micro))
+                    stack.enter_context(maybe_no_sync(mrd, is_last_micro))
 
-                    y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wav_real, wav_gen)
-                    y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wav_real, wav_gen)
+                loss_mel = mel_loss_fn(wav_gen_for_mel, wav_real_for_mel)
+
+                if use_disc and has_wb:
+                    wb_real = wav_real[wb_idx]
+                    wb_gen = wav_gen[wb_idx]
+
+                    y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wb_real, wb_gen)
+                    y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wb_real, wb_gen)
 
                     loss_fm_mpd = feature_loss(fmap_f_r, fmap_f_g)
                     loss_fm_mrd = feature_loss(fmap_r_r, fmap_r_g)
@@ -675,28 +774,24 @@ def train(args):
                     loss_gen_mrd, _ = generator_loss(y_dr_g)
 
                     loss_g = (loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
-                    loss_g.backward()
-
-                accum_loss_d += loss_d.item() * accum_steps
-                accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
-            else:
-                # ── Phase A: mel-loss only ──────────────────────────────────
-                # Random-init discriminators would just be noise at this stage,
-                # so we drop the adversarial path entirely and let the multi-scale
-                # mel loss supervise the projection.
-                with maybe_no_sync(vocoder, is_last_micro):
-                    loss_mel = mel_loss_fn(wav_gen, wav_real)
+                else:
+                    # Phase A, or Phase B with an all-narrowband micro-batch.
                     loss_g = loss_mel / accum_steps
-                    loss_g.backward()
 
+                loss_g.backward()
+
+            if loss_d is not None:
+                accum_loss_d += loss_d.item() * accum_steps
+            if loss_fm_mpd is not None:
+                accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
             accum_loss_g += loss_g.item() * accum_steps
             accum_loss_mel += loss_mel.item()
 
             # Stop training immediately if we hit a non-finite loss — for long
             # runs this saves hours of wasted compute chasing NaNs.
-            if not torch.isfinite(loss_g) or (use_disc and not torch.isfinite(loss_d)):
+            if not torch.isfinite(loss_g) or (loss_d is not None and not torch.isfinite(loss_d)):
                 if is_main_process(rank):
-                    d_str = f", D={loss_d.item()}" if use_disc else ""
+                    d_str = f", D={loss_d.item()}" if loss_d is not None else ""
                     log(f"[Train] ABORT: non-finite loss at step {steps} "
                         f"(G={loss_g.item()}{d_str})")
                 cleanup_distributed()
@@ -755,7 +850,7 @@ def train(args):
                     and steps % args.val_interval == 0
                     and steps > 0):
                 val_mel = validate(vocoder, mel_loss_fn, val_loader, device, sw, steps,
-                                   rank, world_size)
+                                   rank, world_size, src_sr=h.sampling_rate)
                 if is_main_process(rank):
                     log(f"[Val] Step {steps:,d} | val_mel={val_mel:.3f}")
 
@@ -825,11 +920,15 @@ def main():
                         help='Root directory of validation .pt WavLM feature files')
     parser.add_argument('--val_interval', type=int, default=5000,
                         help='Run validation every N steps (default: 5000)')
-    parser.add_argument('--supplementary_dirs', nargs='*', metavar='AUDIO:FEAT',
-                        help='Additional data directories as audio_dir:feat_dir pairs. '
-                             'These are oversampled to the target weight. '
-                             'Example: --supplementary_dirs /data/vocalsound:/data/vocalsound-feats '
-                             '/data/emovdb:/data/emovdb-feats')
+    parser.add_argument('--supplementary_dirs', nargs='*', metavar='AUDIO:FEAT[:NATIVE_SR]',
+                        help='Additional data directories as audio_dir:feat_dir[:native_sr] '
+                             'specs. These are oversampled to the target weight. '
+                             'native_sr (Hz) is the source-content Nyquist for that dataset; '
+                             'narrowband samples are low-passed before mel loss and skipped '
+                             'from the adversarial path so band-limited content does not '
+                             'dilute wideband supervision. Default native_sr = target SR. '
+                             'Example: --supplementary_dirs /data/vocalsound:/data/vocalsound-feats:16000 '
+                             '/data/emovdb:/data/emovdb-feats:24000')
     parser.add_argument('--supplementary_weight', type=float, default=0.15,
                         help='Target fraction of supplementary data per epoch (default: 0.15 = 15%%).')
     args = parser.parse_args()
