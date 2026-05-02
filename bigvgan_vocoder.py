@@ -193,3 +193,134 @@ class BigVGANVocoder(nn.Module):
 
     def remove_weight_norm(self):
         self.bigvgan.remove_weight_norm()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Direct vocoder: WavLM features → BigVGAN with no projection or interpolation
+# ──────────────────────────────────────────────────────────────────────────────
+
+class BigVGANDirectVocoder(nn.Module):
+    """Wrapper that feeds WavLM features straight into BigVGAN.
+
+    Requires a BigVGAN configured with `num_mels=1024` (conv_pre input dim) and
+    `hop_size = sampling_rate // wavlm_frame_rate` so that one WavLM frame
+    produces exactly hop_size audio samples. No projection, no F.interpolate.
+
+    Compared to BigVGANVocoder this removes the 1024→100 bottleneck and the
+    50→93.75 Hz frame-rate adapter; the conv_pre layer of BigVGAN itself is the
+    implicit input adapter, trained jointly with the rest of the generator.
+    """
+
+    def __init__(self, bigvgan_model, target_sr: int | None = None):
+        super().__init__()
+        self.bigvgan = bigvgan_model
+        self.bigvgan_sr = bigvgan_model.h.sampling_rate
+        self.target_sr = target_sr if target_sr is not None else self.bigvgan_sr
+
+        # Sanity: hop_size must equal sampling_rate / wavlm_frame_rate (50 Hz).
+        # Otherwise the number of audio samples produced per WavLM frame won't
+        # match what the upsample stack assumes, and lengths will drift.
+        expected_hop = self.bigvgan_sr // 50
+        if bigvgan_model.h.hop_size != expected_hop:
+            raise ValueError(
+                f"BigVGANDirectVocoder requires hop_size == sampling_rate // 50 "
+                f"({expected_hop}) for WavLM's 50 Hz frame rate, got "
+                f"hop_size={bigvgan_model.h.hop_size} at sr={self.bigvgan_sr}.")
+
+        if bigvgan_model.h.num_mels != 1024:
+            raise ValueError(
+                f"BigVGANDirectVocoder requires num_mels == 1024 (the WavLM "
+                f"feature dim) so conv_pre accepts WavLM features directly, "
+                f"got num_mels={bigvgan_model.h.num_mels}.")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Arguments:
+            - x: (batch, seq_len, 1024) WavLM features at 50 Hz
+        Returns:
+            - (batch, 1, num_samples) waveform at target_sr
+        """
+        # BigVGAN expects (B, C, T)
+        x = x.permute(0, 2, 1)              # (B, 1024, seq_len)
+        wav = self.bigvgan(x)               # (B, 1, seq_len * hop_size)
+
+        if self.target_sr != self.bigvgan_sr:
+            wav = torchaudio.functional.resample(
+                wav.squeeze(1), self.bigvgan_sr, self.target_sr
+            ).unsqueeze(1)
+        return wav
+
+    def remove_weight_norm(self):
+        self.bigvgan.remove_weight_norm()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Partial state-dict loading (for warm-starting from pretrained mel-input BigVGAN)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def load_bigvgan_partial(model: nn.Module, state_dict: dict, verbose: bool = True):
+    """Load weights from `state_dict` into `model`, skipping any keys whose
+    shapes don't match. Returns (loaded_keys, skipped_keys).
+
+    Used to warm-start a direct-path BigVGAN (1024-d input, hop=480, modified
+    upsample stack) from NVIDIA's pretrained 100-band 24 kHz checkpoint:
+    conv_pre and the upsamplers whose strides changed are re-initialized; the
+    AMP resblocks (channel-count compatible since upsample_initial_channel and
+    the number of stages are unchanged) and conv_post transfer cleanly.
+    """
+    own_state = model.state_dict()
+
+    # First pass: identify shape mismatches. Group weight_v/weight_g pairs from
+    # weight_norm so that skipping `<layer>.weight_v` also skips `<layer>.weight_g`
+    # — otherwise the layer ends up with pretrained magnitude on a random
+    # direction, which is a confusing initialization.
+    direct_skip = set()
+    for name, target in own_state.items():
+        if name in state_dict and state_dict[name].shape != target.shape:
+            direct_skip.add(name)
+
+    pair_skip = set()
+    for name in direct_skip:
+        if name.endswith('.weight_v'):
+            pair_skip.add(name[:-len('.weight_v')] + '.weight_g')
+        elif name.endswith('.weight_g'):
+            pair_skip.add(name[:-len('.weight_g')] + '.weight_v')
+
+    skip_set = direct_skip | (pair_skip & own_state.keys() & state_dict.keys())
+
+    loaded = []
+    skipped = []  # entries: (name, ckpt_shape, model_shape, reason)
+    missing_in_ckpt = []
+
+    for name, target in own_state.items():
+        if name not in state_dict:
+            missing_in_ckpt.append(name)
+            continue
+        src = state_dict[name]
+        if name in direct_skip:
+            skipped.append((name, tuple(src.shape), tuple(target.shape), 'shape'))
+            continue
+        if name in skip_set:
+            skipped.append((name, tuple(src.shape), tuple(target.shape), 'paired'))
+            continue
+        target.copy_(src)
+        loaded.append(name)
+
+    extra = [k for k in state_dict.keys() if k not in own_state]
+
+    if verbose:
+        n_shape = sum(1 for s in skipped if s[3] == 'shape')
+        n_paired = sum(1 for s in skipped if s[3] == 'paired')
+        print(f"[BigVGAN partial-load] loaded {len(loaded):,d} tensors, "
+              f"skipped {n_shape:,d} (shape mismatch) + {n_paired:,d} (paired weight_norm), "
+              f"missing {len(missing_in_ckpt):,d} (random init), "
+              f"unused {len(extra):,d}.")
+        if skipped:
+            print("  Skipped (will be trained from random init):")
+            for n, s_src, s_tgt, reason in skipped[:8]:
+                tag = 'shape mismatch' if reason == 'shape' else 'paired with mismatched weight_v/g'
+                print(f"    {n}: ckpt {s_src} → model {s_tgt} ({tag})")
+            if len(skipped) > 8:
+                print(f"    … and {len(skipped) - 8} more")
+
+    return loaded, [s[0] for s in skipped]

@@ -1,13 +1,21 @@
 """
 BigVGAN fine-tuning script for kNN-VC.
 
-Fine-tunes a pretrained BigVGAN v2 (24kHz, 100-band mel) to accept WavLM features
-instead of mel spectrograms. A learned projection layer maps the 1024-dim WavLM
-features to the 100-dim pseudo-mel space expected by BigVGAN.
+Two modes:
 
-Training Phases:
-  Phase A (~50k steps): Train projection layer only, BigVGAN backbone frozen.
-  Phase B (~100k-300k steps): Unfreeze BigVGAN, train end-to-end at lower LR.
+  --mode projection (default): Mel-input BigVGAN-v2 (24 kHz, 100-band) with a
+  learned WavLM→mel projection module bolted in front. Trained in two phases:
+    Phase A (~50k steps): Train projection layer only, BigVGAN backbone frozen.
+    Phase B (~100k-300k steps): Unfreeze BigVGAN, train end-to-end at lower LR.
+
+  --mode direct: BigVGAN configured to consume WavLM features directly
+  (num_mels=1024 input dim, hop_size=480, modified upsample stack). No
+  projection, no F.interpolate. Single-phase end-to-end training. By default
+  warm-starts the transferable layers (resblocks + conv_post + unchanged
+  upsamplers) from NVIDIA's pretrained 100-band 24 kHz checkpoint; conv_pre
+  and the changed upsamplers train from random init. Recommended:
+  --gan_warmup_steps 10000–20000 to let the input adapter find scale on the
+  mel target before the discriminators get involved.
 
 Supports single-GPU and multi-GPU (single-node) training via torchrun.
 
@@ -49,6 +57,7 @@ Dataset format:
 import argparse
 import contextlib
 import itertools
+import json
 import math
 import os
 import random
@@ -77,7 +86,12 @@ from bigvgan.loss import (
     feature_loss,
     generator_loss,
 )
-from bigvgan_vocoder import BigVGANVocoder, build_projection
+from bigvgan_vocoder import (
+    BigVGANVocoder,
+    BigVGANDirectVocoder,
+    build_projection,
+    load_bigvgan_partial,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -346,20 +360,22 @@ def make_weighted_sampler(dataset, supplementary_weight, rank=0, world_size=1, e
 # ──────────────────────────────────────────────────────────────────────────────
 
 def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, phase,
-                    projection_type='linear'):
+                    projection_type='linear', mode='projection'):
     # Unwrap DDP modules to save the underlying state_dict
     def unwrap(m):
         return m.module if isinstance(m, DDP) else m
 
     state = {
-        'projection': unwrap(vocoder).projection.state_dict(),
-        'projection_type': projection_type,
+        'mode': mode,
         'bigvgan': unwrap(vocoder).bigvgan.state_dict(),
         'optim_g': optim_g.state_dict(),
         'steps': steps,
         'epoch': epoch,
         'phase': phase,
     }
+    if mode == 'projection':
+        state['projection'] = unwrap(vocoder).projection.state_dict()
+        state['projection_type'] = projection_type
     # Phase A skips discriminators entirely; their state is only present in Phase B.
     if mpd is not None:
         state['mpd'] = unwrap(mpd).state_dict()
@@ -460,32 +476,66 @@ def train(args):
     device = torch.device(f'cuda:{local_rank}' if torch.cuda.is_available() else 'cpu')
 
     if is_main_process(rank):
-        log(f"[Train] world_size={world_size}, device={device}")
+        log(f"[Train] world_size={world_size}, device={device} mode={args.mode}")
 
-    # ── Load pretrained BigVGAN ──────────────────────────────────────────────
-    bigvgan_model = bigvgan_module.BigVGAN._from_pretrained(
-        model_id='nvidia/bigvgan_v2_24khz_100band_256x',
-        revision=None,
-        cache_dir=None,
-        force_download=False,
-        proxies=None,
-        resume_download=False,
-        local_files_only=False,
-        token=None,
-        use_cuda_kernel=False,
-        map_location=str(device),
-    )
-    h = bigvgan_model.h  # hyperparams: sampling_rate=24000, num_mels=100, hop_size=256, ...
+    # ── Build BigVGAN + vocoder wrapper ──────────────────────────────────────
+    if args.mode == 'projection':
+        # Mel-input BigVGAN with a separate WavLM→mel projection module.
+        bigvgan_model = bigvgan_module.BigVGAN._from_pretrained(
+            model_id='nvidia/bigvgan_v2_24khz_100band_256x',
+            revision=None,
+            cache_dir=None,
+            force_download=False,
+            proxies=None,
+            resume_download=False,
+            local_files_only=False,
+            token=None,
+            use_cuda_kernel=False,
+            map_location=str(device),
+        )
+        h = bigvgan_model.h  # sampling_rate=24000, num_mels=100, hop_size=256, ...
 
-    projection = build_projection(args.projection, in_dim=1024, out_dim=h.num_mels)
-    vocoder = BigVGANVocoder(bigvgan_model, projection, target_sr=h.sampling_rate).to(device)
-    if is_main_process(rank):
-        n_proj = sum(p.numel() for p in projection.parameters())
-        log(f"[Train] Projection: {args.projection} ({n_proj:,d} params)")
+        projection = build_projection(args.projection, in_dim=1024, out_dim=h.num_mels)
+        vocoder = BigVGANVocoder(bigvgan_model, projection, target_sr=h.sampling_rate).to(device)
+        if is_main_process(rank):
+            n_proj = sum(p.numel() for p in projection.parameters())
+            log(f"[Train] Projection: {args.projection} ({n_proj:,d} params)")
+    else:
+        # Direct path: BigVGAN consumes WavLM features end-to-end (num_mels=1024,
+        # hop_size=480, modified upsample stack). Optionally warm-start the
+        # transferable layers (resblocks + conv_post + unchanged upsamplers)
+        # from NVIDIA's pretrained 100-band 24 kHz checkpoint.
+        from bigvgan.env import AttrDict as BVGAttrDict
+        cfg_path = (Path(args.direct_config) if args.direct_config else
+                    Path(__file__).parent / 'BigVGAN' / 'configs'
+                    / 'bigvgan_v2_24khz_wavlm_480x.json')
+        with open(cfg_path) as f:
+            h = BVGAttrDict(json.loads(f.read()))
+        bigvgan_model = bigvgan_module.BigVGAN(h).to(device)
+        if args.warm_start_from_pretrained and not args.resume:
+            if is_main_process(rank):
+                log(f"[Train] Warm-starting direct BigVGAN from pretrained 100-band weights.")
+            pretrained = bigvgan_module.BigVGAN._from_pretrained(
+                model_id='nvidia/bigvgan_v2_24khz_100band_256x',
+                revision=None, cache_dir=None, force_download=False,
+                proxies=None, resume_download=False, local_files_only=False,
+                token=None, use_cuda_kernel=False, map_location=str(device),
+            )
+            load_bigvgan_partial(bigvgan_model, pretrained.state_dict(),
+                                 verbose=is_main_process(rank))
+            del pretrained
 
-    # Phase A trains the projection on mel-loss only; the discriminators would be
-    # random-init noise that fights the projection. Only build them in Phase B.
-    use_disc = (args.phase == 'B')
+        vocoder = BigVGANDirectVocoder(bigvgan_model, target_sr=h.sampling_rate).to(device)
+        if is_main_process(rank):
+            log(f"[Train] Direct mode: hop_size={h.hop_size}, sr={h.sampling_rate}, "
+                f"upsample_rates={list(h.upsample_rates)}.")
+
+    # In projection mode, Phase A trains the projection on mel-loss only — the
+    # discriminators would be random-init noise that fights the projection. In
+    # direct mode there's no Phase A, but the input adapter (conv_pre + the
+    # changed upsamplers) is also random-init, so we honor --gan_warmup_steps
+    # to delay discriminator updates similarly.
+    use_disc = (args.mode == 'direct') or (args.phase == 'B')
 
     # ── Discriminators (Phase B only; match BigVGAN-v2 config) ───────────────
     mpd = None
@@ -506,12 +556,19 @@ def train(args):
     resumed_phase = None
     if args.resume:
         ckpt = load_checkpoint(args.resume, device)
-        ckpt_proj_type = ckpt.get('projection_type', 'linear')
-        if ckpt_proj_type != args.projection:
+        ckpt_mode = ckpt.get('mode', 'projection')
+        if ckpt_mode != args.mode:
             raise ValueError(
-                f"Checkpoint uses projection '{ckpt_proj_type}' but --projection={args.projection}. "
-                f"Use --projection {ckpt_proj_type} to match the checkpoint.")
-        vocoder.projection.load_state_dict(ckpt['projection'])
+                f"Checkpoint trained with mode={ckpt_mode!r} but --mode={args.mode!r}. "
+                f"Use --mode {ckpt_mode} to match the checkpoint.")
+        if args.mode == 'projection':
+            ckpt_proj_type = ckpt.get('projection_type', 'linear')
+            if ckpt_proj_type != args.projection:
+                raise ValueError(
+                    f"Checkpoint uses projection '{ckpt_proj_type}' but "
+                    f"--projection={args.projection}. Use --projection "
+                    f"{ckpt_proj_type} to match the checkpoint.")
+            vocoder.projection.load_state_dict(ckpt['projection'])
         vocoder.bigvgan.load_state_dict(ckpt['bigvgan'])
         # Phase-A checkpoints don't store discriminator state; let them init fresh
         # for the Phase A→B transition.
@@ -523,10 +580,19 @@ def train(args):
         start_epoch = ckpt.get('epoch', 0)
         resumed_phase = ckpt.get('phase', None)
         if is_main_process(rank):
-            log(f"[Train] Resumed from {args.resume} at step {steps} (phase={resumed_phase})")
+            log(f"[Train] Resumed from {args.resume} at step {steps} "
+                f"(mode={ckpt_mode}, phase={resumed_phase})")
 
-    # ── Freeze/unfreeze based on phase ───────────────────────────────────────
-    if args.phase == 'A':
+    # ── Freeze/unfreeze, parameter group, default LR ─────────────────────────
+    if args.mode == 'direct':
+        # Direct mode: end-to-end from the start. No Phase A/B.
+        if is_main_process(rank):
+            log("[Train] Direct mode: end-to-end training (no projection, no phase split).")
+        for p in vocoder.bigvgan.parameters():
+            p.requires_grad = True
+        g_params = list(vocoder.bigvgan.parameters())
+        default_lr = 1e-4
+    elif args.phase == 'A':
         if is_main_process(rank):
             log("[Train] Phase A: training projection layer only, BigVGAN frozen.")
         for p in vocoder.bigvgan.parameters():
@@ -737,7 +803,12 @@ def train(args):
             loss_fm_mpd = None
             loss_fm_mrd = None
 
-            if use_disc and has_wb:
+            # Direct-mode warmup: skip GAN losses entirely while the random-init
+            # input adapter (conv_pre + 3 changed upsamplers) finds reasonable
+            # scale on the mel target. Mirrors the projection-mode Phase-A logic.
+            gan_active = use_disc and (steps >= args.gan_warmup_steps)
+
+            if gan_active and has_wb:
                 wb_real = wav_real[wb_idx]
                 wb_gen = wav_gen[wb_idx]
 
@@ -755,13 +826,13 @@ def train(args):
             # ── Generator update ────────────────────────────────────────────
             with contextlib.ExitStack() as stack:
                 stack.enter_context(maybe_no_sync(vocoder, is_last_micro))
-                if use_disc and has_wb:
+                if gan_active and has_wb:
                     stack.enter_context(maybe_no_sync(mpd, is_last_micro))
                     stack.enter_context(maybe_no_sync(mrd, is_last_micro))
 
                 loss_mel = mel_loss_fn(wav_gen_for_mel, wav_real_for_mel)
 
-                if use_disc and has_wb:
+                if gan_active and has_wb:
                     wb_real = wav_real[wb_idx]
                     wb_gen = wav_gen[wb_idx]
 
@@ -802,13 +873,13 @@ def train(args):
 
             # ── Optimizer step (every accum_steps micro-batches) ───────────
             if args.grad_clip > 0:
-                if use_disc:
+                if gan_active:
                     torch.nn.utils.clip_grad_norm_(
                         itertools.chain(mpd.parameters(), mrd.parameters()),
                         args.grad_clip,
                     )
                 torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
-            if use_disc:
+            if gan_active:
                 optim_d.step()
                 optim_d.zero_grad()
             optim_g.step()
@@ -841,7 +912,9 @@ def train(args):
             # ── Checkpoint (main process only) ──────────────────────────────
             if is_main_process(rank) and steps % args.save_interval == 0 and steps > 0:
                 ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}.pt'
-                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase, args.projection)
+                save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d,
+                                steps, epoch, args.phase, args.projection,
+                                mode=args.mode)
                 log(f"[Train] Saved checkpoint: {ckpt_path}")
                 prune_old_checkpoints(Path(args.checkpoint_dir), args.keep_last_checkpoints)
 
@@ -859,7 +932,9 @@ def train(args):
                 if is_main_process(rank):
                     log(f"[Train] Reached {args.steps:,d} steps. Done.")
                     ckpt_path = Path(args.checkpoint_dir) / f'ckpt_{steps:06d}_final.pt'
-                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, args.phase, args.projection)
+                    save_checkpoint(ckpt_path, vocoder, mpd, mrd, optim_g, optim_d,
+                                    steps, epoch, args.phase, args.projection,
+                                    mode=args.mode)
                 cleanup_distributed()
                 return
 
@@ -887,13 +962,30 @@ def main():
     parser.add_argument('--feat_dir', required=True, help='Root directory of .pt WavLM feature files')
     parser.add_argument('--checkpoint_dir', default='./checkpoints/bigvgan')
     parser.add_argument('--resume', default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--mode', choices=['projection', 'direct'], default='projection',
+                        help='projection: BigVGAN consumes a learned projection of '
+                             'WavLM features (mel-shaped, 100-d, 93.75 Hz). '
+                             'direct: BigVGAN consumes raw WavLM features (1024-d, 50 Hz) '
+                             'with hop_size=480 — no projection, no F.interpolate.')
     parser.add_argument('--projection', default='deconv',
                         choices=['linear', 'mlp', 'conv', 'conv_bn', 'deconv'],
-                        help='Projection layer type: linear (baseline), mlp (2-layer), '
-                             'conv (temporal conv1d), conv_bn (conv + batchnorm), '
+                        help='[projection mode only] Projection layer type: linear (baseline), '
+                             'mlp (2-layer), conv (temporal conv1d), conv_bn (conv + batchnorm), '
                              'deconv (learned upsampling via transposed conv, default)')
     parser.add_argument('--phase', choices=['A', 'B'], default='A',
-                        help='A=projection only, B=end-to-end fine-tune')
+                        help='[projection mode only] A=projection only, B=end-to-end fine-tune. '
+                             'Ignored in direct mode (always end-to-end).')
+    parser.add_argument('--direct_config', default=None,
+                        help='[direct mode only] Path to BigVGAN config JSON. '
+                             'Default: BigVGAN/configs/bigvgan_v2_24khz_wavlm_480x.json')
+    parser.add_argument('--warm_start_from_pretrained', action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help='[direct mode only] Partial-load transferable layers from '
+                             'NVIDIA bigvgan_v2_24khz_100band_256x. Default: enabled.')
+    parser.add_argument('--gan_warmup_steps', type=int, default=0,
+                        help='Skip discriminator updates for the first N steps (mel-loss only). '
+                             'Recommended for direct mode where the input adapter is random-init '
+                             '(e.g. 10000–20000). Default 0 = no warmup.')
     parser.add_argument('--lr_g', type=float, default=None,
                         help='Generator learning rate. Default: 2e-4 for Phase A, 1e-4 for Phase B.')
     parser.add_argument('--lr_d', type=float, default=None,
