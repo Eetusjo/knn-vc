@@ -506,9 +506,12 @@ def train(args):
         # transferable layers (resblocks + conv_post + unchanged upsamplers)
         # from NVIDIA's pretrained 100-band 24 kHz checkpoint.
         from bigvgan.env import AttrDict as BVGAttrDict
-        cfg_path = (Path(args.direct_config) if args.direct_config else
-                    Path(__file__).parent / 'BigVGAN' / 'configs'
-                    / 'bigvgan_v2_24khz_wavlm_480x.json')
+        if args.direct_config:
+            cfg_path = Path(args.direct_config)
+        else:
+            import bigvgan as bigvgan_pkg
+            cfg_path = (Path(bigvgan_pkg.__file__).parent / 'configs'
+                        / 'bigvgan_v2_24khz_wavlm_480x.json')
         with open(cfg_path) as f:
             h = BVGAttrDict(json.loads(f.read()))
         bigvgan_model = bigvgan_module.BigVGAN(h).to(device)
