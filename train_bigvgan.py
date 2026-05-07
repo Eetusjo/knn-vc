@@ -392,7 +392,7 @@ def save_checkpoint(path, vocoder, mpd, mrd, optim_g, optim_d, steps, epoch, pha
 
 
 def load_checkpoint(path, device):
-    return torch.load(path, map_location=device)
+    return torch.load(path, map_location='cpu')
 
 
 def prune_old_checkpoints(checkpoint_dir: Path, keep_last: int):
@@ -644,6 +644,10 @@ def train(args):
             if is_main_process(rank):
                 log(f"[Train] Phase change (ckpt={resumed_phase} → run={args.phase}): "
                     f"re-initializing optimizer states with fresh LR={lr_g:.1e}.")
+
+    if ckpt is not None:
+        del ckpt
+        torch.cuda.empty_cache()
 
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=0.999, last_epoch=max(-1, start_epoch - 1))
     scheduler_d = None
