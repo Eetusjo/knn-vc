@@ -540,6 +540,12 @@ def train(args):
     # to delay discriminator updates similarly.
     use_disc = (args.mode == 'direct') or (args.phase == 'B')
 
+    # Resolve grad-clip and mel-loss weight from config when not set on CLI.
+    grad_clip = args.grad_clip if args.grad_clip is not None else h.get('clip_grad_norm', 1000.0)
+    lambda_mel = float(h.get('lambda_melloss', 45.0))
+    if is_main_process(rank):
+        log(f"[Train] grad_clip={grad_clip:g}, lambda_melloss={lambda_mel:g}")
+
     # ── Discriminators (Phase B only; match BigVGAN-v2 config) ───────────────
     mpd = None
     mrd = None
@@ -619,8 +625,12 @@ def train(args):
     if world_size > 1:
         vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=False)
         if use_disc:
-            mpd = DDP(mpd, device_ids=[local_rank])
-            mrd = DDP(mrd, device_ids=[local_rank])
+            # find_unused_parameters=True: during the G-step backward, D's params
+            # are toggled to requires_grad=False so the FM/gen-GAN gradients
+            # don't pollute D. DDP needs to know that some params won't receive
+            # grads in that backward, otherwise the reducer hangs / errors.
+            mpd = DDP(mpd, device_ids=[local_rank], find_unused_parameters=True)
+            mrd = DDP(mrd, device_ids=[local_rank], find_unused_parameters=True)
 
     # ── Optimizers ───────────────────────────────────────────────────────────
     optim_g = torch.optim.AdamW(g_params, lr=lr_g, betas=(0.8, 0.99))
@@ -831,11 +841,18 @@ def train(args):
                     loss_d.backward()
 
             # ── Generator update ────────────────────────────────────────────
+            # Freeze D's params so loss_g.backward() doesn't accumulate gradients
+            # on D. Without this, the FM and gen-GAN terms write a "make D's
+            # fmaps identical for real vs gen" gradient onto D's params, which
+            # collapses D to a near-constant function within a few thousand
+            # steps. Gradients still flow through D's forward back to wb_gen
+            # (and thus to G) — only the param-grad accumulation is suppressed.
+            if gan_active and has_wb:
+                for p in itertools.chain(mpd.parameters(), mrd.parameters()):
+                    p.requires_grad_(False)
+
             with contextlib.ExitStack() as stack:
                 stack.enter_context(maybe_no_sync(vocoder, is_last_micro))
-                if gan_active and has_wb:
-                    stack.enter_context(maybe_no_sync(mpd, is_last_micro))
-                    stack.enter_context(maybe_no_sync(mrd, is_last_micro))
 
                 loss_mel = mel_loss_fn(wav_gen_for_mel, wav_real_for_mel)
 
@@ -851,12 +868,16 @@ def train(args):
                     loss_gen_mpd, _ = generator_loss(y_df_g)
                     loss_gen_mrd, _ = generator_loss(y_dr_g)
 
-                    loss_g = (loss_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
+                    loss_g = (loss_mel * lambda_mel + loss_fm_mpd + loss_fm_mrd + loss_gen_mpd + loss_gen_mrd) / accum_steps
                 else:
                     # Phase A, or Phase B with an all-narrowband micro-batch.
-                    loss_g = loss_mel / accum_steps
+                    loss_g = (loss_mel * lambda_mel) / accum_steps
 
                 loss_g.backward()
+
+            if gan_active and has_wb:
+                for p in itertools.chain(mpd.parameters(), mrd.parameters()):
+                    p.requires_grad_(True)
 
             if loss_d is not None:
                 accum_loss_d += loss_d.item() * accum_steps
@@ -879,13 +900,13 @@ def train(args):
                 continue
 
             # ── Optimizer step (every accum_steps micro-batches) ───────────
-            if args.grad_clip > 0:
+            if grad_clip > 0:
                 if gan_active:
                     torch.nn.utils.clip_grad_norm_(
                         itertools.chain(mpd.parameters(), mrd.parameters()),
-                        args.grad_clip,
+                        grad_clip,
                     )
-                torch.nn.utils.clip_grad_norm_(g_params, args.grad_clip)
+                torch.nn.utils.clip_grad_norm_(g_params, grad_clip)
             if gan_active:
                 optim_d.step()
                 optim_d.zero_grad()
@@ -1010,9 +1031,10 @@ def main():
     parser.add_argument('--accumulation_steps', type=int, default=1,
                         help='Number of micro-batches to accumulate before each optimizer step. '
                              'Effective batch size = batch_size * num_gpus * accumulation_steps.')
-    parser.add_argument('--grad_clip', type=float, default=1000.0,
-                        help='Gradient norm clipping threshold. 0 = disabled. '
-                             'Default 1000 matches BigVGAN reference config.')
+    parser.add_argument('--grad_clip', type=float, default=None,
+                        help='Gradient norm clipping threshold. None (default) '
+                             'reads h.clip_grad_norm from the BigVGAN config '
+                             '(falls back to 1000.0 if missing). 0 = disabled.')
     parser.add_argument('--val_audio_dir', default=None,
                         help='Root directory of validation .wav files')
     parser.add_argument('--val_feat_dir', default=None,
