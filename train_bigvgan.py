@@ -815,6 +815,7 @@ def train(args):
             loss_d = None
             loss_fm_mpd = None
             loss_fm_mrd = None
+            saved_d_grads = None
 
             # Direct-mode warmup: skip GAN losses entirely while the random-init
             # input adapter (conv_pre + 3 changed upsamplers) finds reasonable
@@ -825,39 +826,42 @@ def train(args):
                 wb_real = wav_real[wb_idx]
                 wb_gen = wav_gen[wb_idx]
 
-                # ── Discriminator update (per-micro, mirrors reference) ─────
-                # zero_grad → D backward → step D. The G-backward below will
-                # write polluting grads onto D's params (FM and gen-GAN terms
-                # have non-zero gradient w.r.t. D's params), but they're never
-                # applied — the next micro's optim_d.zero_grad() wipes them
-                # before the next D backward.
-                #
-                # D updates every micro-batch on a single-batch's worth of
-                # gradient (no accumulation), while G accumulates over
-                # accum_steps. This is the natural translation of the BigVGAN
-                # reference's pattern to gradient-accumulation training. D
-                # tends to benefit from frequent updates with smaller batches.
-                optim_d.zero_grad()
+                # ── Discriminator update (wideband samples only) ────────────
+                # Standard accumulation pattern: no_sync on non-last micros so
+                # local D grads accumulate without all-reduce; on the last
+                # micro, no_sync exits and DDP all-reduces the accumulated
+                # grads in one shot.
+                with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
+                    y_df_r, y_df_g, _, _ = mpd(wb_real, wb_gen.detach())
+                    loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
 
-                y_df_r, y_df_g, _, _ = mpd(wb_real, wb_gen.detach())
-                loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
+                    y_dr_r, y_dr_g, _, _ = mrd(wb_real, wb_gen.detach())
+                    loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
 
-                y_dr_r, y_dr_g, _, _ = mrd(wb_real, wb_gen.detach())
-                loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
+                    loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
+                    loss_d.backward()
 
-                loss_d = loss_d_mpd + loss_d_mrd
-                loss_d.backward()
-
-                if grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        itertools.chain(mpd.parameters(), mrd.parameters()),
-                        grad_clip,
-                    )
-                optim_d.step()
+                # Snapshot D's .grad while it holds ONLY the correct D-step
+                # gradient (locally accumulated, or fully synced on last micro).
+                # The G-backward below would otherwise add the FM + gen-GAN
+                # gradient onto D's params — pulling D toward a constant
+                # function and collapsing it. We restore from this snapshot
+                # after the G-backward to wipe the pollution.
+                saved_d_grads = [
+                    p.grad.detach().clone() if p.grad is not None else None
+                    for p in itertools.chain(mpd.parameters(), mrd.parameters())
+                ]
 
             # ── Generator update ────────────────────────────────────────────
             with contextlib.ExitStack() as stack:
                 stack.enter_context(maybe_no_sync(vocoder, is_last_micro))
+                # During the G-backward, D's params will accumulate the
+                # polluting gradient — but we'll discard it via the snapshot
+                # restore below. Skip DDP all-reduce on those polluting grads
+                # unconditionally to save bandwidth.
+                if gan_active and has_wb and use_ddp:
+                    stack.enter_context(mpd.no_sync())
+                    stack.enter_context(mrd.no_sync())
 
                 loss_mel = mel_loss_fn(wav_gen_for_mel, wav_real_for_mel)
 
@@ -877,8 +881,14 @@ def train(args):
 
                 loss_g.backward()
 
+            # Restore D's gradients to the pre-G-backward snapshot. This
+            # overwrites the polluting grads that the G-backward just wrote.
+            if saved_d_grads is not None:
+                for p, saved in zip(itertools.chain(mpd.parameters(), mrd.parameters()), saved_d_grads):
+                    p.grad = saved
+
             if loss_d is not None:
-                accum_loss_d += loss_d.item()
+                accum_loss_d += loss_d.item() * accum_steps
             if loss_fm_mpd is not None:
                 accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
             accum_loss_g += loss_g.item() * accum_steps
@@ -897,9 +907,17 @@ def train(args):
             if not is_last_micro:
                 continue
 
-            # ── Optimizer step (G only; D was stepped per micro) ───────────
+            # ── Optimizer step (every accum_steps micro-batches) ───────────
             if grad_clip > 0:
+                if gan_active:
+                    torch.nn.utils.clip_grad_norm_(
+                        itertools.chain(mpd.parameters(), mrd.parameters()),
+                        grad_clip,
+                    )
                 torch.nn.utils.clip_grad_norm_(g_params, grad_clip)
+            if gan_active:
+                optim_d.step()
+                optim_d.zero_grad()
             optim_g.step()
             optim_g.zero_grad()
 
