@@ -625,12 +625,8 @@ def train(args):
     if world_size > 1:
         vocoder = DDP(vocoder, device_ids=[local_rank], find_unused_parameters=False)
         if use_disc:
-            # find_unused_parameters=True: during the G-step backward, D's params
-            # are toggled to requires_grad=False so the FM/gen-GAN gradients
-            # don't pollute D. DDP needs to know that some params won't receive
-            # grads in that backward, otherwise the reducer hangs / errors.
-            mpd = DDP(mpd, device_ids=[local_rank], find_unused_parameters=True)
-            mrd = DDP(mrd, device_ids=[local_rank], find_unused_parameters=True)
+            mpd = DDP(mpd, device_ids=[local_rank])
+            mrd = DDP(mrd, device_ids=[local_rank])
 
     # ── Optimizers ───────────────────────────────────────────────────────────
     optim_g = torch.optim.AdamW(g_params, lr=lr_g, betas=(0.8, 0.99))
@@ -829,37 +825,43 @@ def train(args):
                 wb_real = wav_real[wb_idx]
                 wb_gen = wav_gen[wb_idx]
 
-                # ── Discriminator update (wideband samples only) ────────────
-                with maybe_no_sync(mpd, is_last_micro), maybe_no_sync(mrd, is_last_micro):
-                    y_df_r, y_df_g, _, _ = mpd(wb_real, wb_gen.detach())
-                    loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
+                # ── Discriminator update (per-micro, mirrors reference) ─────
+                # zero_grad → D backward → step D. The G-backward below will
+                # write polluting grads onto D's params (FM and gen-GAN terms
+                # have non-zero gradient w.r.t. D's params), but they're never
+                # applied — the next micro's optim_d.zero_grad() wipes them
+                # before the next D backward.
+                #
+                # D updates every micro-batch on a single-batch's worth of
+                # gradient (no accumulation), while G accumulates over
+                # accum_steps. This is the natural translation of the BigVGAN
+                # reference's pattern to gradient-accumulation training. D
+                # tends to benefit from frequent updates with smaller batches.
+                optim_d.zero_grad()
 
-                    y_dr_r, y_dr_g, _, _ = mrd(wb_real, wb_gen.detach())
-                    loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
+                y_df_r, y_df_g, _, _ = mpd(wb_real, wb_gen.detach())
+                loss_d_mpd, _, _ = discriminator_loss(y_df_r, y_df_g)
 
-                    loss_d = (loss_d_mpd + loss_d_mrd) / accum_steps
-                    loss_d.backward()
+                y_dr_r, y_dr_g, _, _ = mrd(wb_real, wb_gen.detach())
+                loss_d_mrd, _, _ = discriminator_loss(y_dr_r, y_dr_g)
+
+                loss_d = loss_d_mpd + loss_d_mrd
+                loss_d.backward()
+
+                if grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        itertools.chain(mpd.parameters(), mrd.parameters()),
+                        grad_clip,
+                    )
+                optim_d.step()
 
             # ── Generator update ────────────────────────────────────────────
-            # Freeze D's params so loss_g.backward() doesn't accumulate gradients
-            # on D. Without this, the FM and gen-GAN terms write a "make D's
-            # fmaps identical for real vs gen" gradient onto D's params, which
-            # collapses D to a near-constant function within a few thousand
-            # steps. Gradients still flow through D's forward back to wb_gen
-            # (and thus to G) — only the param-grad accumulation is suppressed.
-            if gan_active and has_wb:
-                for p in itertools.chain(mpd.parameters(), mrd.parameters()):
-                    p.requires_grad_(False)
-
             with contextlib.ExitStack() as stack:
                 stack.enter_context(maybe_no_sync(vocoder, is_last_micro))
 
                 loss_mel = mel_loss_fn(wav_gen_for_mel, wav_real_for_mel)
 
                 if gan_active and has_wb:
-                    wb_real = wav_real[wb_idx]
-                    wb_gen = wav_gen[wb_idx]
-
                     y_df_r, y_df_g, fmap_f_r, fmap_f_g = mpd(wb_real, wb_gen)
                     y_dr_r, y_dr_g, fmap_r_r, fmap_r_g = mrd(wb_real, wb_gen)
 
@@ -875,12 +877,8 @@ def train(args):
 
                 loss_g.backward()
 
-            if gan_active and has_wb:
-                for p in itertools.chain(mpd.parameters(), mrd.parameters()):
-                    p.requires_grad_(True)
-
             if loss_d is not None:
-                accum_loss_d += loss_d.item() * accum_steps
+                accum_loss_d += loss_d.item()
             if loss_fm_mpd is not None:
                 accum_loss_fm += (loss_fm_mpd.item() + loss_fm_mrd.item())
             accum_loss_g += loss_g.item() * accum_steps
@@ -899,17 +897,9 @@ def train(args):
             if not is_last_micro:
                 continue
 
-            # ── Optimizer step (every accum_steps micro-batches) ───────────
+            # ── Optimizer step (G only; D was stepped per micro) ───────────
             if grad_clip > 0:
-                if gan_active:
-                    torch.nn.utils.clip_grad_norm_(
-                        itertools.chain(mpd.parameters(), mrd.parameters()),
-                        grad_clip,
-                    )
                 torch.nn.utils.clip_grad_norm_(g_params, grad_clip)
-            if gan_active:
-                optim_d.step()
-                optim_d.zero_grad()
             optim_g.step()
             optim_g.zero_grad()
 
